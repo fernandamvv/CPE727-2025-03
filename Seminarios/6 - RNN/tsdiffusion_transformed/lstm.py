@@ -470,7 +470,7 @@ class TSDF_LSTM(TSDiffusion):
             mu_z = self.mog_mu_z(h).view(h.size(0), h.size(1), self.mog_components, -1)
             logvar_z = self.mog_logvar_z(h).view(h.size(0), h.size(1), self.mog_components, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
             # amostra componente com Gumbel-Softmax (straight-through) para preservar multimodalidade
-            comp_onehot = F.gumbel_softmax(pi_z_logits, tau=1.0, hard=False, dim=-1)
+            comp_onehot = F.gumbel_softmax(pi_z_logits, tau=1.0, hard=True, dim=-1)
             mu_sel = (comp_onehot.unsqueeze(-1) * mu_z).sum(dim=2)
             logvar_sel = (comp_onehot.unsqueeze(-1) * logvar_z).sum(dim=2)
             z_vae = mu_sel + torch.randn_like(mu_sel) * torch.exp(0.5 * logvar_sel)
@@ -502,7 +502,7 @@ class TSDF_LSTM(TSDiffusion):
             pi_zt_logits = self.mog_pi_zt(ht)
             mu_zt = self.mog_mu_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1)
             logvar_zt = self.mog_logvar_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            comp_onehot_t = F.gumbel_softmax(pi_zt_logits, tau=1.0, hard=False, dim=-1)
+            comp_onehot_t = F.gumbel_softmax(pi_zt_logits, tau=1.0, hard=True, dim=-1)
             mu_sel_t = (comp_onehot_t.unsqueeze(-1) * mu_zt).sum(dim=2)
             logvar_sel_t = (comp_onehot_t.unsqueeze(-1) * logvar_zt).sum(dim=2)
             z_tmax_lat = mu_sel_t + torch.randn_like(mu_sel_t) * torch.exp(0.5 * logvar_sel_t)
@@ -528,6 +528,7 @@ class TSDF_LSTM(TSDiffusion):
             vae_tmax_logvar = logvar_sel_t
             vae_tmax = self.vae_tmax_decoder(z_tmax_lat)
             vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax_lat).clamp(min=-5.0, max=5.0)
+
 
         x_hat = self.decoder(h) if return_x_hat and self.lam[0]>0 else None
 

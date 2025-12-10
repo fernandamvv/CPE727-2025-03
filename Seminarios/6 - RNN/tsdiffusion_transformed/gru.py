@@ -477,11 +477,17 @@ class TSDF_GRU(TSDiffusion):
             mu_z = self.mog_mu_z(h).view(h.size(0), h.size(1), self.mog_components, -1)
             logvar_z = self.mog_logvar_z(h).view(h.size(0), h.size(1), self.mog_components, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
             # amostra componente com Gumbel-Softmax (straight-through) para preservar multimodalidade
-            comp_onehot = F.gumbel_softmax(pi_z_logits, tau=1.0, hard=False, dim=-1)
-            z_vae = mu_z + torch.randn_like(mu_z) * torch.exp(0.5 * logvar_z)
-            #logvar_sampled = (torch.exp(0.5 * logvar_z) * torch.randn_like(logvar_z)).sum(dim=2)
-            #z_vae = mu_sel + torch.randn_like(mu_sel) * torch.exp(0.5 * logvar_sel)
-            z_vae = (z_vae * comp_onehot.unsqueeze(-1)).sum(dim=2)
+            '''comp_onehot = F.gumbel_softmax(pi_z_logits, tau=1.0, hard=True, dim=-1)
+            mu_sel = (comp_onehot.unsqueeze(-1) * mu_z).sum(dim=2)
+            logvar_sel = (comp_onehot.unsqueeze(-1) * logvar_z).sum(dim=2)
+            z_vae = mu_sel + torch.randn_like(mu_sel) * torch.exp(0.5 * logvar_sel)'''
+            resp = F.softmax(pi_z_logits, dim=-1)  # (B,T,K)
+            z_vae = (torch.sqrt(logvar_z.exp()) * torch.randn_like(logvar_z) + mu_z)  # (B,T,K,C
+            z_vae = (resp.unsqueeze(-1) * z_vae).sum(dim=2)  # (B,T,C)
+            mu_sel = (resp.unsqueeze(-1) * mu_z).sum(dim=2)
+            var_second_moment = (resp.unsqueeze(-1) * (logvar_z.exp() + mu_z ** 2)).sum(dim=2)
+            var_sel = var_second_moment - mu_sel ** 2
+            logvar_sel = var_sel.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
             prior_pi_z_logits = self.mog_pi_z(self.vamp_pseudo_inputs).squeeze(1)
             prior_mu_z_all = self.mog_mu_z(self.vamp_pseudo_inputs).view(self.mog_components,1,self.mog_components,-1).squeeze(1)
             prior_logvar_z_all = self.mog_logvar_z(self.vamp_pseudo_inputs).view(self.mog_components,1,self.mog_components,-1).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
@@ -501,8 +507,8 @@ class TSDF_GRU(TSDiffusion):
             prior_pi_z = torch.log(prior_pi_z_probs.clamp(min=1e-8)).unsqueeze(1)             # (1,1,K)
             prior_mu_z = prior_mu_z.unsqueeze(1)                                              # (1,1,K,C)
             prior_logvar_z = prior_logvar_z.unsqueeze(1)                                      # (1,1,K,C)
-            vae_mu = (mu_z * comp_onehot.unsqueeze(-1)).sum(dim=2)
-            vae_logvar = (logvar_z * comp_onehot.unsqueeze(-1)).sum(dim=2)
+            vae_mu = mu_sel
+            vae_logvar = logvar_sel
             vae_x = self.vae_decoder(z_vae)
             vae_logvar_obs = self.vae_sigma_head(z_vae).clamp(min=-5.0, max=5.0)
 
@@ -510,7 +516,7 @@ class TSDF_GRU(TSDiffusion):
             pi_zt_logits = self.mog_pi_zt(ht)
             mu_zt = self.mog_mu_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1)
             logvar_zt = self.mog_logvar_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            comp_onehot_t = F.gumbel_softmax(pi_zt_logits, tau=1.0, hard=False, dim=-1)
+            comp_onehot_t = F.gumbel_softmax(pi_zt_logits, tau=1.0, hard=True, dim=-1)
             mu_sel_t = (comp_onehot_t.unsqueeze(-1) * mu_zt).sum(dim=2)
             logvar_sel_t = (comp_onehot_t.unsqueeze(-1) * logvar_zt).sum(dim=2)
             z_tmax_lat = mu_sel_t + torch.randn_like(mu_sel_t) * torch.exp(0.5 * logvar_sel_t)
