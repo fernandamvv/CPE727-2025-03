@@ -468,57 +468,64 @@ class TSDF_LSTM(TSDiffusion):
         if self.lam[4] > 0:
             pi_z_logits = self.mog_pi_z(h)
             mu_z = self.mog_mu_z(h).view(h.size(0), h.size(1), self.mog_components, -1)
-            logvar_z = self.mog_logvar_z(h).view(h.size(0), h.size(1), self.mog_components, -1).clamp(
-                min=self.vamp_logvar_min, max=self.vamp_logvar_max
-            )
-            pi_z_soft = torch.softmax(pi_z_logits, dim=-1)
-            mu_mix = (pi_z_soft.unsqueeze(-1) * mu_z).sum(dim=2)
-            var_mix = (pi_z_soft.unsqueeze(-1) * (logvar_z.exp() + mu_z ** 2)).sum(dim=2) - mu_mix ** 2
-            logvar_mix = var_mix.clamp(min=1e-6).log().clamp(
-                min=self.vamp_logvar_min, max=self.vamp_logvar_max
-            )
-            z_vae = mu_mix + torch.randn_like(mu_mix) * torch.exp(0.5 * logvar_mix)
+            logvar_z = self.mog_logvar_z(h).view(h.size(0), h.size(1), self.mog_components, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            # amostra componente com Gumbel-Softmax (straight-through) para preservar multimodalidade
+            comp_onehot = F.gumbel_softmax(pi_z_logits, tau=1.0, hard=False, dim=-1)
+            mu_sel = (comp_onehot.unsqueeze(-1) * mu_z).sum(dim=2)
+            logvar_sel = (comp_onehot.unsqueeze(-1) * logvar_z).sum(dim=2)
+            z_vae = mu_sel + torch.randn_like(mu_sel) * torch.exp(0.5 * logvar_sel)
             prior_pi_z_logits = self.mog_pi_z(self.vamp_pseudo_inputs).squeeze(1)
-            prior_mu_z_all = self.mog_mu_z(self.vamp_pseudo_inputs).view(
-                self.mog_components, 1, self.mog_components, -1
-            ).squeeze(1)
-            prior_logvar_z_all = self.mog_logvar_z(self.vamp_pseudo_inputs).view(
-                self.mog_components, 1, self.mog_components, -1
-            ).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            idx = torch.arange(self.mog_components, device=h.device)
-            prior_pi_z = torch.log_softmax(self.vamp_log_weights, dim=0)[idx].view(1, 1, -1)
-            prior_mu_z = prior_mu_z_all[idx, idx].view(1, 1, self.mog_components, -1)
-            prior_logvar_z = prior_logvar_z_all[idx, idx].view(1, 1, self.mog_components, -1)
-            vae_mu = mu_mix
-            vae_logvar = logvar_mix
+            prior_mu_z_all = self.mog_mu_z(self.vamp_pseudo_inputs).view(self.mog_components,1,self.mog_components,-1).squeeze(1)
+            prior_logvar_z_all = self.mog_logvar_z(self.vamp_pseudo_inputs).view(self.mog_components,1,self.mog_components,-1).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            # combina mistura dos pseudo-inputs em vez de usar apenas a diagonal/weights fixos
+            prior_pi_z_probs_all = torch.softmax(prior_pi_z_logits, dim=-1)  # (K,K)
+            prior_pi_z_raw = prior_pi_z_probs_all.sum(dim=0, keepdim=True)   # (1,K)
+            prior_pi_z_probs = prior_pi_z_raw / prior_pi_z_raw.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            prior_mu_z = (
+                (prior_pi_z_probs_all.unsqueeze(-1) * prior_mu_z_all).sum(dim=0, keepdim=True)
+                / prior_pi_z_raw.unsqueeze(-1).clamp(min=1e-8)
+            )
+            prior_var_z = (
+                (prior_pi_z_probs_all.unsqueeze(-1) * (prior_logvar_z_all.exp() + prior_mu_z_all ** 2)).sum(dim=0, keepdim=True)
+                / prior_pi_z_raw.unsqueeze(-1).clamp(min=1e-8)
+            ) - prior_mu_z ** 2
+            prior_logvar_z = prior_var_z.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            prior_pi_z = torch.log(prior_pi_z_probs.clamp(min=1e-8)).unsqueeze(1)             # (1,1,K)
+            prior_mu_z = prior_mu_z.unsqueeze(1)                                              # (1,1,K,C)
+            prior_logvar_z = prior_logvar_z.unsqueeze(1)                                      # (1,1,K,C)
+            vae_mu = mu_sel
+            vae_logvar = logvar_sel
             vae_x = self.vae_decoder(z_vae)
             vae_logvar_obs = self.vae_sigma_head(z_vae).clamp(min=-5.0, max=5.0)
+
         if self.lam[5] > 0 and ht is not None:
             pi_zt_logits = self.mog_pi_zt(ht)
             mu_zt = self.mog_mu_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1)
-            logvar_zt = self.mog_logvar_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1).clamp(
-                min=self.vamp_logvar_min, max=self.vamp_logvar_max
-            )
-            pi_zt_soft = torch.softmax(pi_zt_logits, dim=-1)
-            mu_mix_t = (pi_zt_soft.unsqueeze(-1) * mu_zt).sum(dim=2)
-            var_mix_t = (pi_zt_soft.unsqueeze(-1) * (logvar_zt.exp() + mu_zt ** 2)).sum(dim=2) - mu_mix_t ** 2
-            logvar_mix_t = var_mix_t.clamp(min=1e-6).log().clamp(
-                min=self.vamp_logvar_min, max=self.vamp_logvar_max
-            )
-            z_tmax_lat = mu_mix_t + torch.randn_like(mu_mix_t) * torch.exp(0.5 * logvar_mix_t)
+            logvar_zt = self.mog_logvar_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            comp_onehot_t = F.gumbel_softmax(pi_zt_logits, tau=1.0, hard=False, dim=-1)
+            mu_sel_t = (comp_onehot_t.unsqueeze(-1) * mu_zt).sum(dim=2)
+            logvar_sel_t = (comp_onehot_t.unsqueeze(-1) * logvar_zt).sum(dim=2)
+            z_tmax_lat = mu_sel_t + torch.randn_like(mu_sel_t) * torch.exp(0.5 * logvar_sel_t)
             prior_pi_zt_logits = self.mog_pi_zt(self.vamp_pseudo_inputs_tmax).squeeze(1)
-            prior_mu_zt_all = self.mog_mu_zt(self.vamp_pseudo_inputs_tmax).view(
-                self.mog_components_tmax, 1, self.mog_components_tmax, -1
-            ).squeeze(1)
-            prior_logvar_zt_all = self.mog_logvar_zt(self.vamp_pseudo_inputs_tmax).view(
-                self.mog_components_tmax, 1, self.mog_components_tmax, -1
-            ).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            idx_t = torch.arange(self.mog_components_tmax, device=ht.device)
-            prior_pi_zt = torch.log_softmax(self.vamp_log_weights_tmax, dim=0)[idx_t].view(1, 1, -1)
-            prior_mu_zt = prior_mu_zt_all[idx_t, idx_t].view(1, 1, self.mog_components_tmax, -1)
-            prior_logvar_zt = prior_logvar_zt_all[idx_t, idx_t].view(1, 1, self.mog_components_tmax, -1)
-            vae_tmax_mu = mu_mix_t
-            vae_tmax_logvar = logvar_mix_t
+            prior_mu_zt_all = self.mog_mu_zt(self.vamp_pseudo_inputs_tmax).view(self.mog_components_tmax,1,self.mog_components_tmax,-1).squeeze(1)
+            prior_logvar_zt_all = self.mog_logvar_zt(self.vamp_pseudo_inputs_tmax).view(self.mog_components_tmax,1,self.mog_components_tmax,-1).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            prior_pi_zt_probs_all = torch.softmax(prior_pi_zt_logits, dim=-1)  # (K_t,K_t)
+            prior_pi_zt_raw = prior_pi_zt_probs_all.sum(dim=0, keepdim=True)   # (1,K_t)
+            prior_pi_zt_probs = prior_pi_zt_raw / prior_pi_zt_raw.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            prior_mu_zt = (
+                (prior_pi_zt_probs_all.unsqueeze(-1) * prior_mu_zt_all).sum(dim=0, keepdim=True)
+                / prior_pi_zt_raw.unsqueeze(-1).clamp(min=1e-8)
+            )
+            prior_var_zt = (
+                (prior_pi_zt_probs_all.unsqueeze(-1) * (prior_logvar_zt_all.exp() + prior_mu_zt_all ** 2)).sum(dim=0, keepdim=True)
+                / prior_pi_zt_raw.unsqueeze(-1).clamp(min=1e-8)
+            ) - prior_mu_zt ** 2
+            prior_logvar_zt = prior_var_zt.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            prior_pi_zt = torch.log(prior_pi_zt_probs.clamp(min=1e-8)).unsqueeze(1)           # (1,1,K_t)
+            prior_mu_zt = prior_mu_zt.unsqueeze(1)                                            # (1,1,K_t,C)
+            prior_logvar_zt = prior_logvar_zt.unsqueeze(1)                                    # (1,1,K_t,C)
+            vae_tmax_mu = mu_sel_t
+            vae_tmax_logvar = logvar_sel_t
             vae_tmax = self.vae_tmax_decoder(z_tmax_lat)
             vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax_lat).clamp(min=-5.0, max=5.0)
 
@@ -540,17 +547,17 @@ class TSDF_LSTM(TSDiffusion):
             vae_tmax_logvar,
             vae_logvar_obs,
             vae_tmax_logvar_obs,
-            pi_z_logits,
+            pi_z_logits if 'pi_z_logits' in locals() else None,
             mu_z,
             logvar_z,
-            prior_pi_z,
-            prior_mu_z,
-            prior_logvar_z,
-            pi_zt_logits,
-            mu_zt,
-            logvar_zt,
-            prior_pi_zt,
-            prior_mu_zt,
-            prior_logvar_zt,
+            prior_pi_z if 'prior_pi_z' in locals() else None,
+            prior_mu_z if 'prior_mu_z' in locals() else None,
+            prior_logvar_z if 'prior_logvar_z' in locals() else None,
+            pi_zt_logits if 'pi_zt_logits' in locals() else None,
+            mu_zt if 'mu_zt' in locals() else None,
+            logvar_zt if 'logvar_zt' in locals() else None,
+            prior_pi_zt if 'prior_pi_zt' in locals() else None,
+            prior_mu_zt if 'prior_mu_zt' in locals() else None,
+            prior_logvar_zt if 'prior_logvar_zt' in locals() else None,
         )
     
