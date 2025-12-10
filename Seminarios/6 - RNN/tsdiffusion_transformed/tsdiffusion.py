@@ -65,16 +65,19 @@ def _log_prob_diag_gaussian(z: torch.Tensor, mu: torch.Tensor, logvar: torch.Ten
 
 def _mog_log_prob(pi_logits: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
     """
-    pi_logits: (B,T,K)
-    mu/logvar: (B,T,K,C)
-    z: (B,T,C)
-    returns log p(z): (B,T)
+    Calcula log p(z) para uma mistura diagonal de gaussianas.
+    Suporta dimensões de amostra extras (e.g., S) graças ao broadcast.
+    Args:
+        pi_logits: (..., K)
+        mu/logvar: (..., K, C)
+        z: (..., C) ou (S,...,C)
+    Returns:
+        log p(z): (...), com os mesmos eixos à frente de K/C.
     """
-    log_pi = torch.log_softmax(pi_logits, dim=-1)  # (B,T,K)
-    z_exp = z.unsqueeze(2)  # (B,T,1,C)
-    comp_log = _log_prob_diag_gaussian(z_exp, mu, logvar).sum(dim=-1)  # (B,T,K)
-    log_p = torch.logsumexp(log_pi + comp_log, dim=-1)  # (B,T)
-    return log_p
+    log_pi = torch.log_softmax(pi_logits, dim=-1)
+    z_exp = z.unsqueeze(-2)  # alinhamento com eixo dos componentes
+    comp_log = _log_prob_diag_gaussian(z_exp, mu, logvar).sum(dim=-1)
+    return torch.logsumexp(log_pi + comp_log, dim=-1)
 
 def _sample_mog(pi_logits: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, num_samples: int = 8) -> torch.Tensor:
     """
@@ -183,8 +186,8 @@ class TSDiffusion(ODEJumpEncoder):
             self.mog_pi_z = nn.Linear(hidden_dim, self.mog_components)
             self.mog_mu_z = nn.Linear(hidden_dim, self.mog_components * hidden_dim)
             self.mog_logvar_z = nn.Linear(hidden_dim, self.mog_components * hidden_dim)
-            # prior Vamp no latente
-            self.vamp_log_weights = nn.Parameter(torch.zeros(self.mog_components))
+            # prior Vamp no latente (logits aprendidos via pseudo‑inputs)
+            self.vamp_log_weights = nn.Parameter(torch.zeros(self.mog_components))  # mantido para compatibilidade, não usado
             self.vamp_pseudo_inputs = nn.Parameter(
                 torch.randn(self.mog_components, 1, hidden_dim) * self.vamp_init_scale
             )
@@ -315,40 +318,62 @@ class TSDiffusion(ODEJumpEncoder):
             pi_z_logits = self.mog_pi_z(h)
             mu_z = self.mog_mu_z(h).view(h.size(0), h.size(1), self.mog_components, -1)
             logvar_z = self.mog_logvar_z(h).view(h.size(0), h.size(1), self.mog_components, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            pi_z_soft = torch.softmax(pi_z_logits, dim=-1)
-            mu_mix = (pi_z_soft.unsqueeze(-1) * mu_z).sum(dim=2)
-            var_mix = (pi_z_soft.unsqueeze(-1) * (logvar_z.exp() + mu_z ** 2)).sum(dim=2) - mu_mix ** 2
-            logvar_mix = var_mix.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            z_vae = mu_mix + torch.randn_like(mu_mix) * torch.exp(0.5 * logvar_mix)
+            # amostra componente com Gumbel-Softmax (straight-through) para preservar multimodalidade
+            comp_onehot = F.gumbel_softmax(pi_z_logits, tau=1.0, hard=True, dim=-1)
+            mu_sel = (comp_onehot.unsqueeze(-1) * mu_z).sum(dim=2)
+            logvar_sel = (comp_onehot.unsqueeze(-1) * logvar_z).sum(dim=2)
+            z_vae = mu_sel + torch.randn_like(mu_sel) * torch.exp(0.5 * logvar_sel)
             prior_pi_z_logits = self.mog_pi_z(self.vamp_pseudo_inputs).squeeze(1)
             prior_mu_z_all = self.mog_mu_z(self.vamp_pseudo_inputs).view(self.mog_components,1,self.mog_components,-1).squeeze(1)
             prior_logvar_z_all = self.mog_logvar_z(self.vamp_pseudo_inputs).view(self.mog_components,1,self.mog_components,-1).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            idx = torch.arange(self.mog_components, device=h.device)
-            prior_pi_z = torch.log_softmax(self.vamp_log_weights, dim=0)[idx].view(1,1,-1)
-            prior_mu_z = prior_mu_z_all[idx, idx].view(1,1,self.mog_components,-1)
-            prior_logvar_z = prior_logvar_z_all[idx, idx].view(1,1,self.mog_components,-1)
-            vae_mu = mu_mix
-            vae_logvar = logvar_mix
+            # combina mistura dos pseudo-inputs em vez de usar apenas a diagonal/weights fixos
+            prior_pi_z_probs_all = torch.softmax(prior_pi_z_logits, dim=-1)  # (K,K)
+            prior_pi_z_raw = prior_pi_z_probs_all.sum(dim=0, keepdim=True)   # (1,K)
+            prior_pi_z_probs = prior_pi_z_raw / prior_pi_z_raw.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            prior_mu_z = (
+                (prior_pi_z_probs_all.unsqueeze(-1) * prior_mu_z_all).sum(dim=0, keepdim=True)
+                / prior_pi_z_raw.unsqueeze(-1).clamp(min=1e-8)
+            )
+            prior_var_z = (
+                (prior_pi_z_probs_all.unsqueeze(-1) * (prior_logvar_z_all.exp() + prior_mu_z_all ** 2)).sum(dim=0, keepdim=True)
+                / prior_pi_z_raw.unsqueeze(-1).clamp(min=1e-8)
+            ) - prior_mu_z ** 2
+            prior_logvar_z = prior_var_z.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            prior_pi_z = torch.log(prior_pi_z_probs.clamp(min=1e-8)).unsqueeze(1)             # (1,1,K)
+            prior_mu_z = prior_mu_z.unsqueeze(1)                                              # (1,1,K,C)
+            prior_logvar_z = prior_logvar_z.unsqueeze(1)                                      # (1,1,K,C)
+            vae_mu = mu_sel
+            vae_logvar = logvar_sel
             vae_x = self.vae_decoder(z_vae)
             vae_logvar_obs = self.vae_sigma_head(z_vae).clamp(min=-5.0, max=5.0)
         if self.lam[5] > 0 and ht is not None:
             pi_zt_logits = self.mog_pi_zt(ht)
             mu_zt = self.mog_mu_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1)
             logvar_zt = self.mog_logvar_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            pi_zt_soft = torch.softmax(pi_zt_logits, dim=-1)
-            mu_mix_t = (pi_zt_soft.unsqueeze(-1) * mu_zt).sum(dim=2)
-            var_mix_t = (pi_zt_soft.unsqueeze(-1) * (logvar_zt.exp() + mu_zt ** 2)).sum(dim=2) - mu_mix_t ** 2
-            logvar_mix_t = var_mix_t.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            z_tmax_lat = mu_mix_t + torch.randn_like(mu_mix_t) * torch.exp(0.5 * logvar_mix_t)
+            comp_onehot_t = F.gumbel_softmax(pi_zt_logits, tau=1.0, hard=True, dim=-1)
+            mu_sel_t = (comp_onehot_t.unsqueeze(-1) * mu_zt).sum(dim=2)
+            logvar_sel_t = (comp_onehot_t.unsqueeze(-1) * logvar_zt).sum(dim=2)
+            z_tmax_lat = mu_sel_t + torch.randn_like(mu_sel_t) * torch.exp(0.5 * logvar_sel_t)
             prior_pi_zt_logits = self.mog_pi_zt(self.vamp_pseudo_inputs_tmax).squeeze(1)
             prior_mu_zt_all = self.mog_mu_zt(self.vamp_pseudo_inputs_tmax).view(self.mog_components_tmax,1,self.mog_components_tmax,-1).squeeze(1)
             prior_logvar_zt_all = self.mog_logvar_zt(self.vamp_pseudo_inputs_tmax).view(self.mog_components_tmax,1,self.mog_components_tmax,-1).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
-            idx_t = torch.arange(self.mog_components_tmax, device=ht.device)
-            prior_pi_zt = torch.log_softmax(self.vamp_log_weights_tmax, dim=0)[idx_t].view(1,1,-1)
-            prior_mu_zt = prior_mu_zt_all[idx_t, idx_t].view(1,1,self.mog_components_tmax,-1)
-            prior_logvar_zt = prior_logvar_zt_all[idx_t, idx_t].view(1,1,self.mog_components_tmax,-1)
-            vae_tmax_mu = mu_mix_t
-            vae_tmax_logvar = logvar_mix_t
+            prior_pi_zt_probs_all = torch.softmax(prior_pi_zt_logits, dim=-1)  # (K_t,K_t)
+            prior_pi_zt_raw = prior_pi_zt_probs_all.sum(dim=0, keepdim=True)   # (1,K_t)
+            prior_pi_zt_probs = prior_pi_zt_raw / prior_pi_zt_raw.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            prior_mu_zt = (
+                (prior_pi_zt_probs_all.unsqueeze(-1) * prior_mu_zt_all).sum(dim=0, keepdim=True)
+                / prior_pi_zt_raw.unsqueeze(-1).clamp(min=1e-8)
+            )
+            prior_var_zt = (
+                (prior_pi_zt_probs_all.unsqueeze(-1) * (prior_logvar_zt_all.exp() + prior_mu_zt_all ** 2)).sum(dim=0, keepdim=True)
+                / prior_pi_zt_raw.unsqueeze(-1).clamp(min=1e-8)
+            ) - prior_mu_zt ** 2
+            prior_logvar_zt = prior_var_zt.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            prior_pi_zt = torch.log(prior_pi_zt_probs.clamp(min=1e-8)).unsqueeze(1)           # (1,1,K_t)
+            prior_mu_zt = prior_mu_zt.unsqueeze(1)                                            # (1,1,K_t,C)
+            prior_logvar_zt = prior_logvar_zt.unsqueeze(1)                                    # (1,1,K_t,C)
+            vae_tmax_mu = mu_sel_t
+            vae_tmax_logvar = logvar_sel_t
             vae_tmax = self.vae_tmax_decoder(z_tmax_lat)
             vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax_lat).clamp(min=-5.0, max=5.0)
 
@@ -606,16 +631,10 @@ class TSDiffusion(ODEJumpEncoder):
                 vae_recon = ((x - vae_x).pow(2) * mask_vae * cc).sum()
             vae_recon_div = (mask_vae * cc).sum().clamp(min=1.0)
             if pi_z_logits is not None and mu_z is not None and logvar_z is not None and prior_pi_z is not None and prior_mu_z is not None and prior_logvar_z is not None:
-                S_lat = 8
+                S_lat = 4
                 z_samples = _sample_mog(pi_z_logits, mu_z, logvar_z, num_samples=S_lat)
-                pi_q = pi_z_logits.unsqueeze(0).expand(S_lat, -1, -1, -1)
-                mu_q = mu_z.unsqueeze(0).expand(S_lat, -1, -1, -1, -1)
-                logvar_q = logvar_z.unsqueeze(0).expand(S_lat, -1, -1, -1, -1)
-                pi_p = prior_pi_z.expand(S_lat, mu_z.size(0), mu_z.size(1), -1)
-                mu_p = prior_mu_z.expand(S_lat, mu_z.size(0), mu_z.size(1), -1, -1)
-                logvar_p = prior_logvar_z.expand(S_lat, mu_z.size(0), mu_z.size(1), -1, -1)
-                log_q = _mog_log_prob(pi_q, mu_q, logvar_q, z_samples)
-                log_p = _mog_log_prob(pi_p, mu_p, logvar_p, z_samples)
+                log_q = _mog_log_prob(pi_z_logits, mu_z, logvar_z, z_samples)
+                log_p = _mog_log_prob(prior_pi_z, prior_mu_z, prior_logvar_z, z_samples)
                 kl_bt = (log_q - log_p).mean(dim=0)
                 weights_lat = mask_ts.squeeze(-1) if mask_ts is not None else torch.ones_like(kl_bt)
                 vae_kl = (kl_bt * weights_lat).sum()
@@ -646,16 +665,10 @@ class TSDiffusion(ODEJumpEncoder):
             else:
                 vae_recon_t = ((err_change ** 2 * 1000 + err_no_change ** 2)*mask_vae).sum()
             if pi_zt_logits is not None and mu_zt is not None and logvar_zt is not None and prior_pi_zt is not None and prior_mu_zt is not None and prior_logvar_zt is not None:
-                S_tlat = 8
+                S_tlat = 4
                 z_samples_t = _sample_mog(pi_zt_logits, mu_zt, logvar_zt, num_samples=S_tlat)
-                pi_q_t = pi_zt_logits.unsqueeze(0).expand(S_tlat, -1, -1, -1)
-                mu_q_t = mu_zt.unsqueeze(0).expand(S_tlat, -1, -1, -1, -1)
-                logvar_q_t = logvar_zt.unsqueeze(0).expand(S_tlat, -1, -1, -1, -1)
-                pi_p_t = prior_pi_zt.expand(S_tlat, mu_zt.size(0), mu_zt.size(1), -1)
-                mu_p_t = prior_mu_zt.expand(S_tlat, mu_zt.size(0), mu_zt.size(1), -1, -1)
-                logvar_p_t = prior_logvar_zt.expand(S_tlat, mu_zt.size(0), mu_zt.size(1), -1, -1)
-                log_q_t = _mog_log_prob(pi_q_t, mu_q_t, logvar_q_t, z_samples_t)
-                log_p_t = _mog_log_prob(pi_p_t, mu_p_t, logvar_p_t, z_samples_t)
+                log_q_t = _mog_log_prob(pi_zt_logits, mu_zt, logvar_zt, z_samples_t)
+                log_p_t = _mog_log_prob(prior_pi_zt, prior_mu_zt, prior_logvar_zt, z_samples_t)
                 kl_bt_t = (log_q_t - log_p_t).mean(dim=0)
                 weights_lat_t = mask_vae.squeeze(-1)
                 vae_kl_t = (kl_bt_t * weights_lat_t).sum()
@@ -980,15 +993,15 @@ class TSDiffusion(ODEJumpEncoder):
             train_L6 = total_train[5][0] / max(total_train[5][1], 1.0)
 
             if validate and val_loader is not None:
+                val_parts = [
+                    f"Epoch {ep}/{epochs} | "
+                    f"Train(sampled) L1:{train_L1:.6f} L2:{train_L2:.6f} L3:{train_L3:.6f}  L4:{train_L4:.6f} L5:{train_L5:.6f} L6:{train_L6:.6f} | "
+                ]
                 val_metrics = self.test_model(val_loader, y_seq=y_win[val_idx], 
                                               all_groups=all_groups, only_gru=only_gru,
                                               reconstruction_test=reconstruction_test,
                                               status_pred_window=delta_pred_window
                                               )
-                val_parts = [
-                    f"Epoch {ep}/{epochs} | "
-                    f"Train(sampled) L1:{train_L1:.6f} L2:{train_L2:.6f} L3:{train_L3:.6f}  L4:{train_L4:.6f} L5:{train_L5:.6f} L6:{train_L6:.6f} | "
-                ]
                 if self.lam[0] > 0:
                     val_parts.append(
                         f"Val macro:{val_metrics['macro_mse']:.6f} ± {val_metrics['macro_se']:.6f} | "
@@ -1008,13 +1021,13 @@ class TSDiffusion(ODEJumpEncoder):
                     val_parts.append(
                         f"Val macro (VAE):{val_metrics['macro_mse_v']:.6f} ± {val_metrics['macro_se_v']:.6f} | "
                         f"Val micro (VAE):{val_metrics['micro_mse_v']:.6f} ± {val_metrics['micro_se_v']:.6f} | "
-                        f"ELBO:{val_metrics['micro_elbo_v']:.6f} NLL:{val_metrics['micro_nll_v']:.6f} cov90:{val_metrics['micro_cov_v']:.3f} width90:{val_metrics['micro_width_v']:.6f} "
-                )
+                        f"CRPS:{val_metrics['micro_crps_v']:.6f} NLL:{val_metrics['micro_nll_v']:.6f} cov90:{val_metrics['micro_cov_v']:.3f} width90:{val_metrics['micro_width_v']:.6f} "
+                    )
                 if len(self.lam) > 5 and self.lam[5] > 0:
                     val_parts.append(
                         f"Val macro (VAE tmax):{val_metrics['macro_mse_vt']:.6f} ± {val_metrics['macro_se_vt']:.6f} | "
                         f"Val micro (VAE tmax):{val_metrics['micro_mse_vt']:.6f} ± {val_metrics['micro_se_vt']:.6f} | "
-                        f"ELBO:{val_metrics['micro_elbo_vt']:.6f} NLL:{val_metrics['micro_nll_vt']:.6f} cov90:{val_metrics['micro_cov_vt']:.3f} width90:{val_metrics['micro_width_vt']:.6f} "
+                        f"CRPS:{val_metrics['micro_crps_vt']:.6f} NLL:{val_metrics['micro_nll_vt']:.6f} cov90:{val_metrics['micro_cov_vt']:.3f} width90:{val_metrics['micro_width_vt']:.6f} "
                     )
                 print("".join(val_parts))
             else:
@@ -1062,21 +1075,21 @@ class TSDiffusion(ODEJumpEncoder):
                 test_parts.append(
                     f"          >> Test (VAE) macro:{test_metrics['macro_mse_v']:.6f} ± {test_metrics['macro_se_v']:.6f} | "
                     f"micro:{test_metrics['micro_mse_v']:.6f} ± {test_metrics['micro_se_v']:.6f} | "
-                    f"ELBO:{test_metrics['micro_elbo_v']:.6f} NLL:{test_metrics['micro_nll_v']:.6f} cov90:{test_metrics['micro_cov_v']:.3f} width90:{test_metrics['micro_width_v']:.6f}"
+                    f"CRPS:{test_metrics['micro_crps_v']:.6f} NLL:{test_metrics['micro_nll_v']:.6f} cov90:{test_metrics['micro_cov_v']:.3f} width90:{test_metrics['micro_width_v']:.6f}"
                 )
             if len(self.lam) > 5 and self.lam[5] > 0:
                 test_parts.append(
                     f"          >> Test (VAE tmax) macro:{test_metrics['macro_mse_vt']:.6f} ± {test_metrics['macro_se_vt']:.6f} | "
                     f"micro:{test_metrics['micro_mse_vt']:.6f} ± {test_metrics['micro_se_vt']:.6f} | "
-                    f"ELBO:{test_metrics['micro_elbo_vt']:.6f} NLL:{test_metrics['micro_nll_vt']:.6f} cov90:{test_metrics['micro_cov_vt']:.3f} width90:{test_metrics['micro_width_vt']:.6f}"
+                    f"CRPS:{test_metrics['micro_crps_vt']:.6f} NLL:{test_metrics['micro_nll_vt']:.6f} cov90:{test_metrics['micro_cov_vt']:.3f} width90:{test_metrics['micro_width_vt']:.6f}"
                 )
             if test_parts:
                 print("\n".join(test_parts))
 
             if early_stopping:
                 score = (test_metrics["micro_mse"]*self.lam[0] + test_metrics["micro_mse_n"]*self.lam[1] + \
-                         test_metrics["micro_mse_s"]*self.lam[2] + test_metrics["micro_elbo_v"]*self.lam[4] + \
-                         (test_metrics.get("micro_elbo_vt", 0.0) * self.lam[5] if len(self.lam)>5 else 0.0) + \
+                         test_metrics["micro_mse_s"]*self.lam[2] + test_metrics["micro_crps_v"]*self.lam[4] + \
+                         (test_metrics.get("micro_crps_vt", 0.0) * self.lam[5] if len(self.lam)>5 else 0.0) + \
                 2 * (test_metrics["micro_se"]*self.lam[0] + test_metrics["micro_se_n"]*self.lam[1] \
                      + test_metrics["micro_se_s"]*self.lam[2]))
                 improved = score < best_score
@@ -1107,11 +1120,11 @@ class TSDiffusion(ODEJumpEncoder):
         if self.lam[4] > 0:
             parts.append(f"macro (VAE): {final_metrics['macro_mse_v']:.6f} ± {final_metrics['macro_se_v']:.6f} | "
                          f"micro (VAE): {final_metrics['micro_mse_v']:.6f} ± {final_metrics['micro_se_v']:.6f} | "
-                         f"ELBO:{final_metrics['micro_elbo_v']:.6f} NLL:{final_metrics['micro_nll_v']:.6f} cov90:{final_metrics['micro_cov_v']:.3f} width90:{final_metrics['micro_width_v']:.6f} ")
+                         f"CRPS:{final_metrics['micro_crps_v']:.6f} NLL:{final_metrics['micro_nll_v']:.6f} cov90:{final_metrics['micro_cov_v']:.3f} width90:{final_metrics['micro_width_v']:.6f} ")
         if len(self.lam) > 5 and self.lam[5] > 0:
             parts.append(f"macro (VAE tmax): {final_metrics['macro_mse_vt']:.6f} ± {final_metrics['macro_se_vt']:.6f} | "
                          f"micro (VAE tmax): {final_metrics['micro_mse_vt']:.6f} ± {final_metrics['micro_se_vt']:.6f} | "
-                         f"ELBO:{final_metrics['micro_elbo_vt']:.6f} NLL:{final_metrics['micro_nll_vt']:.6f} cov90:{final_metrics['micro_cov_vt']:.3f} width90:{final_metrics['micro_width_vt']:.6f} ")
+                         f"CRPS:{final_metrics['micro_crps_vt']:.6f} NLL:{final_metrics['micro_nll_vt']:.6f} cov90:{final_metrics['micro_cov_vt']:.3f} width90:{final_metrics['micro_width_vt']:.6f} ")
         print("".join(parts))
         pg = test_metrics["per_group_mse"]
         pg_sew = test_metrics["per_group_se_w"]
@@ -1135,14 +1148,14 @@ class TSDiffusion(ODEJumpEncoder):
         {g: f"{pg_v[g]:.6f} ± {pg_sew_v[g]:.6f} (n={pg_cnt[g]})" for g in sorted(pg.keys())}
         )
         if self.lam[4] > 0:
-            pg_elbo_v = test_metrics["per_group_elbo_v"]
-            print("          >> per_group ELBO VAE:",
-            {g: f"{pg_elbo_v[g]:.6f}" for g in sorted(pg_elbo_v.keys())}
+            pg_crps_v = test_metrics.get("per_group_crps_v", {})
+            print("          >> per_group CRPS VAE:",
+            {g: f"{pg_crps_v[g]:.6f}" for g in sorted(pg_crps_v.keys())}
             )
         if len(self.lam) > 5 and self.lam[5] > 0:
-            pg_elbo_vt = test_metrics["per_group_elbo_vt"]
-            print("          >> per_group ELBO VAE tmax:",
-            {g: f"{pg_elbo_vt[g]:.6f}" for g in sorted(pg_elbo_vt.keys())}
+            pg_crps_vt = test_metrics.get("per_group_crps_vt", {})
+            print("          >> per_group CRPS VAE tmax:",
+            {g: f"{pg_crps_vt[g]:.6f}" for g in sorted(pg_crps_vt.keys())}
             )
         yield None
 
@@ -1184,8 +1197,8 @@ class TSDiffusion(ODEJumpEncoder):
             ) for i in range(13)]
             res_index = [
                 (res[i]["micro_mse"]*self.lam[0] + res[i]["micro_mse_n"]*self.lam[1] + \
-                 res[i]["micro_mse_s"]*self.lam[2] + res[i]["micro_elbo_v"]*self.lam[4] + \
-                 (res[i].get("micro_elbo_vt", 0.0) * self.lam[5] if len(self.lam)>5 else 0.0) + \
+                res[i]["micro_mse_s"]*self.lam[2] + res[i]["micro_crps_v"]*self.lam[4] + \
+                (res[i].get("micro_crps_vt", 0.0) * self.lam[5] if len(self.lam)>5 else 0.0) + \
                 2 * (res[i]["micro_se"]*self.lam[0] + res[i]["micro_se_n"]*self.lam[1] \
                      + res[i]["micro_se_s"] * self.lam[2] + res[i]["micro_se_v"]*self.lam[4] \
                      + (res[i].get("micro_se_vt", 0.0) * self.lam[5] if len(self.lam)>5 else 0.0)) 
@@ -1265,10 +1278,10 @@ class TSDiffusion(ODEJumpEncoder):
         G_COV_VT   = {}
         G_TOTC_VT  = {}
         G_WWIDTH_VT= {}
-        G_ELBO_V_NUM  = {}
-        G_ELBO_V_DEN  = {}
-        G_ELBO_VT_NUM = {}
-        G_ELBO_VT_DEN = {}
+        G_CRPS_V_NUM  = {}
+        G_CRPS_V_DEN  = {}
+        G_CRPS_VT_NUM = {}
+        G_CRPS_VT_DEN = {}
 
         # globais (micro)
         T_W, T_SSE, T_WM2 = 0.0, 0.0, 0.0
@@ -1282,8 +1295,8 @@ class TSDiffusion(ODEJumpEncoder):
         T_WIDTH_V = 0.0
         T_COV_VT, T_COV_DEN_VT = 0.0, 0.0
         T_WIDTH_VT = 0.0
-        T_ELBO_V_NUM, T_ELBO_V_DEN = 0.0, 0.0
-        T_ELBO_VT_NUM, T_ELBO_VT_DEN = 0.0, 0.0
+        T_CRPS_V_NUM, T_CRPS_V_DEN = 0.0, 0.0
+        T_CRPS_VT_NUM, T_CRPS_VT_DEN = 0.0, 0.0
 
 
         with torch.no_grad():
@@ -1323,7 +1336,38 @@ class TSDiffusion(ODEJumpEncoder):
                 out = self.forward(
                     x_masked, timestamps=ts_batch, static_feats=s, 
                     return_x_hat=True, mask=m_train, mask_ts=mask_ts, test=False,only_gru=only_gru)
-                _, _, _, x_hat, tmax_hat, noise, noise_hat, vae_x, vae_mu, vae_logvar, vae_tmax, vae_tmax_mu, vae_tmax_logvar, vae_logvar_obs, vae_tmax_logvar_obs, *rest = out
+                (
+                    _,
+                    _,
+                    _,
+                    x_hat,
+                    tmax_hat,
+                    noise,
+                    noise_hat,
+                    vae_x,
+                    vae_mu,
+                    vae_logvar,
+                    vae_tmax,
+                    vae_tmax_mu,
+                    vae_tmax_logvar,
+                    vae_logvar_obs,
+                    vae_tmax_logvar_obs,
+                    *rest
+                ) = out
+                (
+                    pi_z_logits,
+                    mu_z,
+                    logvar_z,
+                    prior_pi_z,
+                    prior_mu_z,
+                    prior_logvar_z,
+                    pi_zt_logits,
+                    mu_zt,
+                    logvar_zt,
+                    prior_pi_zt,
+                    prior_mu_zt,
+                    prior_logvar_zt,
+                ) = (rest + [None] * 12)[:12]
                 
                 offset_state_pred = (p - ts_batch.unsqueeze(-1)).clamp(min=0,max=status_pred_window) / status_pred_window
                 if tmax_hat is None:
@@ -1364,10 +1408,10 @@ class TSDiffusion(ODEJumpEncoder):
                     vae_x = x
 
                 sse_v_bt  = ((x - vae_x)**2 * mask_err * cc).sum(dim=(1, 2))
-                nobs_v_bt = (mask_err * cc).sum(dim=(1, 2)).clamp(min=1.0)
-                mse_v_bt  = (sse_v_bt / nobs_v_bt).detach().cpu().numpy()
+                nobs_v_bt_t = (mask_err * cc).sum(dim=(1, 2)).clamp(min=1.0)
+                mse_v_bt  = (sse_v_bt / nobs_v_bt_t).detach().cpu().numpy()
                 sse_v_bt  = sse_v_bt.detach().cpu().numpy()
-                nobs_v_bt = nobs_v_bt.detach().cpu().numpy()
+                nobs_v_bt = nobs_v_bt_t.detach().cpu().numpy()
                 mu_v = vae_x
                 logvar_v = vae_logvar_obs if vae_logvar_obs is not None else torch.zeros_like(mu_v)
                 logvar_v = (logvar_v + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
@@ -1383,6 +1427,31 @@ class TSDiffusion(ODEJumpEncoder):
                 nll_v = (nll_v * mask_err * cc).sum(dim=(1, 2))
                 nll_v_bt = nll_v.detach().cpu().numpy()
                 kl_v_bt = kl_v_per_b.detach().cpu().numpy()
+                # CRPS da mistura: Monte Carlo sobre componentes/latentes (custo moderado)
+                std_norm = torch.distributions.Normal(0.0, 1.0)
+                crps_v_bt = None
+                if pi_z_logits is not None and mu_z is not None and logvar_z is not None:
+                    S_crps = 8
+                    z_samples_mc = _sample_mog(pi_z_logits, mu_z, logvar_z, num_samples=S_crps)  # (S,B,T,C)
+                    crps_s = []
+                    for s_idx in range(S_crps):
+                        mu_s = self.vae_decoder(z_samples_mc[s_idx])
+                        logvar_obs_s = self.vae_sigma_head(z_samples_mc[s_idx]).clamp(min=-5.0, max=5.0)
+                        logvar_v_s = (logvar_obs_s + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                        sigma_s = torch.exp(0.5 * logvar_v_s)
+                        z_v_s = ((x - mu_s) / sigma_s).clamp(min=-20.0, max=20.0)
+                        crps_elem_s = sigma_s * (
+                            z_v_s * (2 * std_norm.cdf(z_v_s) - 1) + 2 * std_norm.log_prob(z_v_s).exp() - 1 / math.sqrt(math.pi)
+                        )
+                        crps_s.append((crps_elem_s * mask_err * cc).sum(dim=(1, 2)) / nobs_v_bt_t)
+                    crps_v_bt = torch.stack(crps_s, dim=0).mean(dim=0).detach().cpu().numpy()
+                if crps_v_bt is None:
+                    z_v = ((x - mu_v) / sigma_v).clamp(min=-20.0, max=20.0)
+                    crps_elem_v = sigma_v * (
+                        z_v * (2 * std_norm.cdf(z_v) - 1) + 2 * std_norm.log_prob(z_v).exp() - 1 / math.sqrt(math.pi)
+                    )
+                    crps_v = (crps_elem_v * mask_err * cc).sum(dim=(1, 2)) / nobs_v_bt_t
+                    crps_v_bt = crps_v.detach().cpu().numpy()
                 covered_v = (
                     (x >= (mu_v - z90 * sigma_v))
                     * (x <= (mu_v + z90 * sigma_v))
@@ -1399,10 +1468,10 @@ class TSDiffusion(ODEJumpEncoder):
                     offset_vae_tmax = vae_tmax.clamp(min=0,max=1) 
                 err_vt = mask_tmax * ((offset_vae_tmax - offset_state_pred) * changing_state)    # (B,T,S)
                 sse_vt_bt = (err_vt ** 2).sum(dim=(1,2))
-                nobs_vt_bt = (changing_state * mask_tmax).sum(dim=(1, 2))+1e-8 
-                mse_vt_bt = (sse_vt_bt / nobs_vt_bt).detach().cpu().numpy()
+                nobs_vt_bt_t = (changing_state * mask_tmax).sum(dim=(1, 2))+1e-8 
+                mse_vt_bt = (sse_vt_bt / nobs_vt_bt_t).detach().cpu().numpy()
                 sse_vt_bt = sse_vt_bt.detach().cpu().numpy()
-                nobs_vt_bt = nobs_vt_bt.detach().cpu().numpy()
+                nobs_vt_bt = nobs_vt_bt_t.detach().cpu().numpy()
                 mu_vt = offset_vae_tmax * changing_state * mask_tmax
                 logvar_vt = vae_tmax_logvar_obs if vae_tmax_logvar_obs is not None else torch.zeros_like(mu_vt)
                 logvar_vt = (logvar_vt + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
@@ -1418,6 +1487,30 @@ class TSDiffusion(ODEJumpEncoder):
                 nll_vt = (nll_vt * changing_state * mask_tmax).sum(dim=(1, 2))
                 nll_vt_bt = nll_vt.detach().cpu().numpy()
                 kl_vt_bt = kl_vt_per_b.detach().cpu().numpy()
+                # CRPS para tmax (mixture via Monte Carlo se disponível)
+                crps_vt_bt = None
+                if pi_zt_logits is not None and mu_zt is not None and logvar_zt is not None:
+                    S_crps_t = 8
+                    zt_samples_mc = _sample_mog(pi_zt_logits, mu_zt, logvar_zt, num_samples=S_crps_t)  # (S,B,T,C)
+                    crps_t_s = []
+                    for s_idx in range(S_crps_t):
+                        mu_t_s = self.vae_tmax_decoder(zt_samples_mc[s_idx])
+                        logvar_obs_t_s = self.vae_tmax_sigma_head(zt_samples_mc[s_idx]).clamp(min=-5.0, max=5.0)
+                        logvar_vt_s = (logvar_obs_t_s + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                        sigma_t_s = torch.exp(0.5 * logvar_vt_s) * changing_state * mask_tmax
+                        z_vt_s = ((offset_state_pred - mu_t_s) / sigma_t_s.clamp(min=1e-8)).clamp(min=-20.0, max=20.0)
+                        crps_elem_t_s = sigma_t_s * (
+                            z_vt_s * (2 * std_norm.cdf(z_vt_s) - 1) + 2 * std_norm.log_prob(z_vt_s).exp() - 1 / math.sqrt(math.pi)
+                        )
+                        crps_t_s.append((crps_elem_t_s * changing_state * mask_tmax).sum(dim=(1, 2)) / nobs_vt_bt_t)
+                    crps_vt_bt = torch.stack(crps_t_s, dim=0).mean(dim=0).detach().cpu().numpy()
+                if crps_vt_bt is None:
+                    z_vt = ((offset_state_pred - mu_vt) / sigma_vt.clamp(min=1e-8)).clamp(min=-20.0, max=20.0)
+                    crps_elem_vt = sigma_vt * (
+                        z_vt * (2 * std_norm.cdf(z_vt) - 1) + 2 * std_norm.log_prob(z_vt).exp() - 1 / math.sqrt(math.pi)
+                    )
+                    crps_vt = (crps_elem_vt * changing_state * mask_tmax).sum(dim=(1, 2)) / nobs_vt_bt_t
+                    crps_vt_bt = crps_vt.detach().cpu().numpy()
                 covered_vt = (
                     (offset_state_pred >= (mu_vt - z90 * sigma_vt))
                     * (offset_state_pred  <= (mu_vt + z90 * sigma_vt)) * changing_state * mask_tmax
@@ -1448,10 +1541,7 @@ class TSDiffusion(ODEJumpEncoder):
                     sse_v = float(sse_v_bt[b])
                     nll_vb = float(nll_v_bt[b])
                     kl_vb = float(kl_v_bt[b])
-                    # NLL média por ponto observado e KL médio por dimensão latente
-                    nll_mean_vb = nll_vb / max(w_v, 1e-8)
-                    kl_mean_vb = kl_vb / max(z_latent_dim, 1.0)
-                    elbo_vb = nll_mean_vb + kl_mean_vb
+                    crps_vb = float(crps_v_bt[b])
                     cov_vb = float(cov_v_bt[b])
                     cov_den_vb = float(cov_den_v_bt[b])
                     width_vb = float(width_v_bt[b])
@@ -1476,9 +1566,7 @@ class TSDiffusion(ODEJumpEncoder):
                     sse_vt = float(sse_vt_bt[b])
                     nll_vtb = float(nll_vt_bt[b])
                     kl_vtb = float(kl_vt_bt[b])
-                    nll_mean_vtb = nll_vtb / max(w_vt, 1e-8)
-                    kl_mean_vtb = kl_vtb / max(z_tmax_latent_dim, 1.0)
-                    elbo_vtb = nll_mean_vtb + kl_mean_vtb
+                    crps_vtb = float(crps_vt_bt[b])
                     cov_vtb = float(cov_vt_bt[b])
                     cov_den_vtb = float(cov_den_vt_bt[b])
                     width_vtb = float(width_vt_bt[b])
@@ -1490,14 +1578,14 @@ class TSDiffusion(ODEJumpEncoder):
                     G_TOTC_V[g] = G_TOTC_V.get(g, 0.0) + cov_den_vb
                     G_COV_V[g] = G_COV_V.get(g, 0.0) + cov_vb
                     G_WWIDTH_V[g] = G_WWIDTH_V.get(g, 0.0) + width_vb * cov_den_vb
-                    G_ELBO_V_NUM[g] = G_ELBO_V_NUM.get(g, 0.0) + elbo_vb * w_v
-                    G_ELBO_V_DEN[g] = G_ELBO_V_DEN.get(g, 0.0) + w_v
+                    G_CRPS_V_NUM[g] = G_CRPS_V_NUM.get(g, 0.0) + crps_vb * w_v
+                    G_CRPS_V_DEN[g] = G_CRPS_V_DEN.get(g, 0.0) + w_v
                     G_NLL_VT[g] = G_NLL_VT.get(g, 0.0) + nll_vtb
                     G_TOTC_VT[g] = G_TOTC_VT.get(g, 0.0) + cov_den_vtb
                     G_COV_VT[g] = G_COV_VT.get(g, 0.0) + cov_vtb
                     G_WWIDTH_VT[g] = G_WWIDTH_VT.get(g, 0.0) + width_vtb * cov_den_vtb
-                    G_ELBO_VT_NUM[g] = G_ELBO_VT_NUM.get(g, 0.0) + elbo_vtb * w_vt
-                    G_ELBO_VT_DEN[g] = G_ELBO_VT_DEN.get(g, 0.0) + w_vt
+                    G_CRPS_VT_NUM[g] = G_CRPS_VT_NUM.get(g, 0.0) + crps_vtb * w_vt
+                    G_CRPS_VT_DEN[g] = G_CRPS_VT_DEN.get(g, 0.0) + w_vt
                     G_W_N[g]   = G_W_N.get(g, 0.0)   + w_n
                     G_SSE_N[g] = G_SSE_N.get(g, 0.0) + sse_n
                     G_WM2_N[g] = G_WM2_N.get(g, 0.0) + (w_n * mse_n * mse_n)
@@ -1528,15 +1616,15 @@ class TSDiffusion(ODEJumpEncoder):
                     T_COV_V += cov_vb
                     T_COV_DEN_V += cov_den_vb
                     T_WIDTH_V += width_vb * cov_den_vb
-                    T_ELBO_V_NUM += elbo_vb * w_v
-                    T_ELBO_V_DEN += w_v
+                    T_CRPS_V_NUM += crps_vb * w_v
+                    T_CRPS_V_DEN += w_v
                     T_NLL_VT += nll_vtb
                     T_W_NLL_VT += w_vt
                     T_COV_VT += cov_vtb
                     T_COV_DEN_VT += cov_den_vtb
                     T_WIDTH_VT += width_vtb * cov_den_vtb
-                    T_ELBO_VT_NUM += elbo_vtb * w_vt
-                    T_ELBO_VT_DEN += w_vt
+                    T_CRPS_VT_NUM += crps_vtb * w_vt
+                    T_CRPS_VT_DEN += w_vt
 
 
         # grupos a reportar
@@ -1569,9 +1657,9 @@ class TSDiffusion(ODEJumpEncoder):
                 "per_group_sum_nobs_vt": {},
                 "micro_nll_v": float("nan"), "micro_nll_vt": float("nan"),
                 "macro_nll_v": float("nan"), "macro_nll_vt": float("nan"),
-                "micro_elbo_v": float("nan"), "micro_elbo_vt": float("nan"),
-                "macro_elbo_v": float("nan"), "macro_elbo_vt": float("nan"),
-                "per_group_elbo_v": {}, "per_group_elbo_vt": {},
+                "micro_crps_v": float("nan"), "micro_crps_vt": float("nan"),
+                "macro_crps_v": float("nan"), "macro_crps_vt": float("nan"),
+                "per_group_crps_v": {}, "per_group_crps_vt": {},
                 "micro_cov_v": float("nan"), "micro_cov_vt": float("nan"),
                 "macro_cov_v": float("nan"), "macro_cov_vt": float("nan"),
                 "micro_width_v": float("nan"), "micro_width_vt": float("nan"),
@@ -1606,8 +1694,8 @@ class TSDiffusion(ODEJumpEncoder):
         per_group_cov_vt       = {}
         per_group_width_v      = {}
         per_group_width_vt     = {}
-        per_group_elbo_v       = {}
-        per_group_elbo_vt      = {}
+        per_group_crps_v       = {}
+        per_group_crps_vt      = {}
         per_group_nll_v        = {}
         per_group_nll_vt       = {}
         per_group_cov_v        = {}
@@ -1740,7 +1828,7 @@ class TSDiffusion(ODEJumpEncoder):
                 per_group_nll_v[g] = float(G_NLL_V.get(g, 0.0) / max(Wg_v, 1e-8))
                 per_group_cov_v[g] = float(G_COV_V.get(g, 0.0) / max(G_TOTC_V.get(g, 0.0), 1.0))
                 per_group_width_v[g] = float(G_WWIDTH_V.get(g, 0.0) / max(G_TOTC_V.get(g, 0.0), 1.0))
-                per_group_elbo_v[g] = float(G_ELBO_V_NUM.get(g, 0.0) / max(G_ELBO_V_DEN.get(g, 0.0), 1e-8))
+                per_group_crps_v[g] = float(G_CRPS_V_NUM.get(g, 0.0) / max(G_CRPS_V_DEN.get(g, 0.0), 1e-8))
             else:
                 per_group_mse_v[g]    = float("nan")
                 per_group_se_unw_v[g] = float("nan")
@@ -1748,7 +1836,7 @@ class TSDiffusion(ODEJumpEncoder):
                 per_group_nll_v[g]    = float("nan")
                 per_group_cov_v[g]    = float("nan")
                 per_group_width_v[g]  = float("nan")
-                per_group_elbo_v[g]   = float("nan")
+                per_group_crps_v[g]   = float("nan")
 
             if Wg_vt > 0.0:
                 mu_g_vt = G_SSE_VT[g] / Wg_vt
@@ -1773,7 +1861,7 @@ class TSDiffusion(ODEJumpEncoder):
                 per_group_nll_vt[g] = float(G_NLL_VT.get(g, 0.0) / max(Wg_vt, 1e-8))
                 per_group_cov_vt[g] = float(G_COV_VT.get(g, 0.0) / max(G_TOTC_VT.get(g, 0.0), 1.0))
                 per_group_width_vt[g] = float(G_WWIDTH_VT.get(g, 0.0) / max(G_TOTC_VT.get(g, 0.0), 1.0))
-                per_group_elbo_vt[g] = float(G_ELBO_VT_NUM.get(g, 0.0) / max(G_ELBO_VT_DEN.get(g, 0.0), 1e-8))
+                per_group_crps_vt[g] = float(G_CRPS_VT_NUM.get(g, 0.0) / max(G_CRPS_VT_DEN.get(g, 0.0), 1e-8))
             else:
                 per_group_mse_vt[g]    = float("nan")
                 per_group_se_unw_vt[g] = float("nan")
@@ -1781,7 +1869,7 @@ class TSDiffusion(ODEJumpEncoder):
                 per_group_nll_vt[g]    = float("nan")
                 per_group_cov_vt[g]    = float("nan")
                 per_group_width_vt[g]  = float("nan")
-                per_group_elbo_vt[g]   = float("nan")
+                per_group_crps_vt[g]   = float("nan")
 
 
         # micro (ponderado por nobs) – SE ponderado
@@ -1807,8 +1895,8 @@ class TSDiffusion(ODEJumpEncoder):
             micro_se_vt = float(math.sqrt(s2_micro_vt / max(total_cnt, 1))) if T_W_VT > 0 else float("nan")
             micro_nll_v = float(T_NLL_V / max(T_W_NLL_V, 1e-8)) if T_W_NLL_V > 0 else float("nan")
             micro_nll_vt = float(T_NLL_VT / max(T_W_NLL_VT, 1e-8)) if T_W_NLL_VT > 0 else float("nan")
-            micro_elbo_v = float(T_ELBO_V_NUM / max(T_ELBO_V_DEN, 1e-8)) if T_ELBO_V_DEN > 0 else float("nan")
-            micro_elbo_vt = float(T_ELBO_VT_NUM / max(T_ELBO_VT_DEN, 1e-8)) if T_ELBO_VT_DEN > 0 else float("nan")
+            micro_crps_v = float(T_CRPS_V_NUM / max(T_CRPS_V_DEN, 1e-8)) if T_CRPS_V_DEN > 0 else float("nan")
+            micro_crps_vt = float(T_CRPS_VT_NUM / max(T_CRPS_VT_DEN, 1e-8)) if T_CRPS_VT_DEN > 0 else float("nan")
             micro_cov_v = float(T_COV_V / max(T_COV_DEN_V, 1.0)) if T_COV_DEN_V > 0 else float("nan")
             micro_cov_vt = float(T_COV_VT / max(T_COV_DEN_VT, 1.0)) if T_COV_DEN_VT > 0 else float("nan")
             micro_width_v = float(T_WIDTH_V / max(T_COV_DEN_V, 1.0)) if T_COV_DEN_V > 0 else float("nan")
@@ -1822,7 +1910,7 @@ class TSDiffusion(ODEJumpEncoder):
             micro_nll_v = float("nan"); micro_nll_vt = float("nan")
             micro_cov_v = float("nan"); micro_cov_vt = float("nan")
             micro_width_v = float("nan"); micro_width_vt = float("nan")
-            micro_elbo_v = float("nan"); micro_elbo_vt = float("nan")
+            micro_crps_v = float("nan"); micro_crps_vt = float("nan")
 
         # macro: média das MÉDIAS por grupo (não-ponderado) e SE entre grupos
         mu_gs = [per_group_mse[g] for g in groups if np.isfinite(per_group_mse[g])]
@@ -1836,8 +1924,8 @@ class TSDiffusion(ODEJumpEncoder):
         mu_gs_cov_vt = [per_group_cov_vt[g] for g in groups if np.isfinite(per_group_cov_vt[g])] if 'per_group_cov_vt' in locals() else []
         mu_gs_width_v = [per_group_width_v[g] for g in groups if np.isfinite(per_group_width_v[g])] if 'per_group_width_v' in locals() else []
         mu_gs_width_vt = [per_group_width_vt[g] for g in groups if np.isfinite(per_group_width_vt[g])] if 'per_group_width_vt' in locals() else []
-        mu_gs_elbo_v = [per_group_elbo_v[g] for g in groups if np.isfinite(per_group_elbo_v[g])] if 'per_group_elbo_v' in locals() else []
-        mu_gs_elbo_vt = [per_group_elbo_vt[g] for g in groups if np.isfinite(per_group_elbo_vt[g])] if 'per_group_elbo_vt' in locals() else []
+        mu_gs_crps_v = [per_group_crps_v[g] for g in groups if np.isfinite(per_group_crps_v[g])] if 'per_group_crps_v' in locals() else []
+        mu_gs_crps_vt = [per_group_crps_vt[g] for g in groups if np.isfinite(per_group_crps_vt[g])] if 'per_group_crps_vt' in locals() else []
         G_eff = len(mu_gs)
         G_eff_n = len(mu_gs_n)
         G_eff_s = len(mu_gs_s)
@@ -1849,8 +1937,6 @@ class TSDiffusion(ODEJumpEncoder):
         G_eff_cov_vt = len(mu_gs_cov_vt)
         G_eff_width_v = len(mu_gs_width_v)
         G_eff_width_vt = len(mu_gs_width_vt)
-        G_eff_elbo_v = len(mu_gs_elbo_v)
-        G_eff_elbo_vt = len(mu_gs_elbo_vt)
         if G_eff >= 1:
             macro_mse = float(np.mean(mu_gs))
             if G_eff >= 2:
@@ -1905,8 +1991,8 @@ class TSDiffusion(ODEJumpEncoder):
         macro_cov_vt = float(np.mean(mu_gs_cov_vt)) if G_eff_cov_vt >= 1 else float("nan")
         macro_width_v = float(np.mean(mu_gs_width_v)) if G_eff_width_v >= 1 else float("nan")
         macro_width_vt = float(np.mean(mu_gs_width_vt)) if G_eff_width_vt >= 1 else float("nan")
-        macro_elbo_v = float(np.mean(mu_gs_elbo_v)) if G_eff_elbo_v >= 1 else float("nan")
-        macro_elbo_vt = float(np.mean(mu_gs_elbo_vt)) if G_eff_elbo_vt >= 1 else float("nan")
+        macro_crps_v = float(np.mean(mu_gs_crps_v)) if len(mu_gs_crps_v) >= 1 else float("nan")
+        macro_crps_vt = float(np.mean(mu_gs_crps_vt)) if len(mu_gs_crps_vt) >= 1 else float("nan")
 
 
         return {
@@ -1931,12 +2017,16 @@ class TSDiffusion(ODEJumpEncoder):
             "per_group_sum_nobs_s": per_group_sum_nobs_s,
             "macro_mse_v": macro_mse_v, "macro_se_v": macro_se_v,
             "micro_mse_v": micro_mse_v, "micro_se_v": micro_se_v,
+            "macro_crps_v": float(np.mean(mu_gs_crps_v)) if len(mu_gs_crps_v)>0 else float("nan"),
+            "micro_crps_v": float(micro_crps_v),
             "per_group_mse_v": per_group_mse_v,
             "per_group_se_w_v": per_group_se_w_v,
             "per_group_se_unw_v": per_group_se_unw_v,
             "per_group_sum_nobs_v": per_group_sum_nobs_v,
             "macro_mse_vt": macro_mse_vt, "macro_se_vt": macro_se_vt,
             "micro_mse_vt": micro_mse_vt, "micro_se_vt": micro_se_vt,
+            "macro_crps_vt": float(np.mean(mu_gs_crps_vt)) if len(mu_gs_crps_vt)>0 else float("nan"),
+            "micro_crps_vt": float(micro_crps_vt),
             "per_group_mse_vt": per_group_mse_vt,
             "per_group_se_w_vt": per_group_se_w_vt,
             "per_group_se_unw_vt": per_group_se_unw_vt,
@@ -1945,10 +2035,8 @@ class TSDiffusion(ODEJumpEncoder):
             "macro_nll_v": macro_nll_v, "macro_nll_vt": macro_nll_vt,
             "per_group_nll_v": per_group_nll_v,
             "per_group_nll_vt": per_group_nll_vt,
-            "micro_elbo_v": micro_elbo_v, "micro_elbo_vt": micro_elbo_vt,
-            "macro_elbo_v": macro_elbo_v, "macro_elbo_vt": macro_elbo_vt,
-            "per_group_elbo_v": per_group_elbo_v,
-            "per_group_elbo_vt": per_group_elbo_vt,
+            "per_group_crps_v": per_group_crps_v,
+            "per_group_crps_vt": per_group_crps_vt,
             "micro_cov_v": micro_cov_v, "micro_cov_vt": micro_cov_vt,
             "macro_cov_v": macro_cov_v, "macro_cov_vt": macro_cov_vt,
             "per_group_cov_v": per_group_cov_v,
@@ -2346,6 +2434,18 @@ class TSDiffusion(ODEJumpEncoder):
                     vae_tmax_logvar,
                     vae_logvar_obs,
                     vae_tmax_logvar_obs,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    pi_zt_logits,
+                    mu_zt,
+                    logvar_zt,
+                    _,
+                    _,
+                    _,
                 ) = self.forward(
                     x * m,
                     timestamps=ts_batch,
@@ -2429,9 +2529,10 @@ class TSDiffusion(ODEJumpEncoder):
             grid_points: int = 200,
     ) -> pd.DataFrame:
         """
-        Extrai a PDF teórica (normal aproximada) de tmax para o ponto definido pelo slice
-        fornecido (mesmo estilo de generate_samples). Retorna um DataFrame com μ/σ (em segundos)
-        e a curva de densidade em uma grade de tempo.
+        Extrai a PDF teórica de tmax para o ponto definido pelo slice fornecido (mesmo estilo
+        de generate_samples). Se o VAE com MoG/Vamp estiver ativo, devolve a PDF da mistura;
+        caso contrário, utiliza a aproximação normal padrão. Retorna um DataFrame com μ/σ (em
+        segundos) e a curva de densidade em uma grade de tempo.
         """
         if self.status_dim <= 0 or (self.lam[2] <= 0 and self.lam[5] <= 0):
             raise RuntimeError("O modelo não possui cabeça de tmax/variância para gerar PDFs.")
@@ -2501,6 +2602,18 @@ class TSDiffusion(ODEJumpEncoder):
                     vae_tmax_logvar,
                     vae_logvar_obs,
                     vae_tmax_logvar_obs,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    pi_zt_logits,
+                    mu_zt,
+                    logvar_zt,
+                    _,
+                    _,
+                    _,
                 ) = self.forward(
                     x * m,
                     timestamps=ts_batch,
@@ -2511,8 +2624,80 @@ class TSDiffusion(ODEJumpEncoder):
                     test=True,
                 )
 
-                # parâmetros da normal em fração da janela (0-1)
-                if self.lam[5] > 0 and vae_tmax_mu is not None:
+                mog_pdf = None
+                comp_weights = None
+                comp_means_sec = None
+                comp_sigmas_sec = None
+
+                has_mog = (
+                    self.lam[5] > 0
+                    and pi_zt_logits is not None
+                    and mu_zt is not None
+                    and logvar_zt is not None
+                    and hasattr(self, "vae_tmax_decoder")
+                )
+
+                if has_mog:
+                    # Usa Monte Carlo sobre os componentes do VAE para compor a PDF completa
+                    pi_last = torch.softmax(pi_zt_logits[:, -1, :], dim=-1)  # (B,K)
+                    lat_mu_last = mu_zt[:, -1, :, :]  # (B,K,C)
+                    lat_logvar_last = logvar_zt[:, -1, :, :]
+
+                    num_pdf_latent_samples = int(getattr(self, "pdf_tmax_latent_samples", 4))
+                    num_pdf_latent_samples = max(1, num_pdf_latent_samples)
+                    std_lat = torch.exp(0.5 * lat_logvar_last)
+                    eps = torch.randn(
+                        (num_pdf_latent_samples, *lat_mu_last.shape),
+                        device=lat_mu_last.device,
+                        dtype=lat_mu_last.dtype,
+                    )
+                    lat_samples = lat_mu_last.unsqueeze(0) + std_lat.unsqueeze(0) * eps
+                    lat_samples_flat = lat_samples.reshape(-1, lat_mu_last.size(-1))
+
+                    comp_mean_frac = self.vae_tmax_decoder(lat_samples_flat).view(
+                        num_pdf_latent_samples, lat_mu_last.size(0), lat_mu_last.size(1), -1
+                    )
+                    comp_logvar_obs = self.vae_tmax_sigma_head(lat_samples_flat).view(
+                        num_pdf_latent_samples, lat_mu_last.size(0), lat_mu_last.size(1), -1
+                    )
+                    comp_logvar_obs = (comp_logvar_obs + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                    comp_std_frac = torch.exp(0.5 * comp_logvar_obs).clamp(min=1e-6)
+                    comp_var_frac = comp_std_frac ** 2
+
+                    grid_exp = grid_fraction.view(1, 1, -1, 1, 1)
+                    comp_mean_exp = comp_mean_frac.unsqueeze(2)
+                    comp_std_exp = comp_std_frac.unsqueeze(2)
+                    comp_pdf_frac = (
+                        torch.exp(-0.5 * ((grid_exp - comp_mean_exp) / comp_std_exp) ** 2)
+                        / (comp_std_exp * math.sqrt(2 * math.pi))
+                    )
+                    weights_samples = (pi_last.unsqueeze(0) / float(num_pdf_latent_samples))
+                    weighted_pdf = comp_pdf_frac * weights_samples.unsqueeze(2).unsqueeze(-1)
+                    pdf_frac = weighted_pdf.sum(dim=0).sum(dim=2)
+                    mog_pdf = (pdf_frac / max(float(status_pred_window), 1e-6)).cpu().numpy()
+
+                    mean_frac = (weights_samples.unsqueeze(-1) * comp_mean_frac).sum(dim=0).sum(dim=1)
+                    second_moment = (
+                        weights_samples.unsqueeze(-1) * (comp_var_frac + comp_mean_frac ** 2)
+                    ).sum(dim=0).sum(dim=1)
+                    var_frac = (second_moment - mean_frac ** 2).clamp(min=1e-8)
+
+                    comp_weights = weights_samples.permute(1, 0, 2).reshape(pi_last.size(0), -1).cpu().numpy()
+                    comp_means_sec = (
+                        (comp_mean_frac * status_pred_window)
+                        .permute(1, 0, 2, 3)
+                        .reshape(pi_last.size(0), -1, comp_mean_frac.size(-1))
+                        .cpu()
+                        .numpy()
+                    )
+                    comp_sigmas_sec = (
+                        (comp_std_frac * status_pred_window)
+                        .permute(1, 0, 2, 3)
+                        .reshape(pi_last.size(0), -1, comp_std_frac.size(-1))
+                        .cpu()
+                        .numpy()
+                    )
+                elif self.lam[5] > 0 and vae_tmax_mu is not None:
                     mean_frac = self.vae_tmax_decoder(vae_tmax_mu)
                     logvar_obs = self.vae_tmax_sigma_head(vae_tmax_mu)
                     logvar_obs = (logvar_obs + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
@@ -2525,8 +2710,14 @@ class TSDiffusion(ODEJumpEncoder):
                     mean_frac = tmax_hat if tmax_hat is not None else torch.zeros_like(m[..., :1])
                     var_frac = torch.full_like(mean_frac, 0.05)
 
-                mean_last = mean_frac[:, -1, :]  # (1,S)
-                var_last = var_frac[:, -1, :]
+                if mean_frac.dim() == 3:
+                    mean_last = mean_frac[:, -1, :]
+                else:
+                    mean_last = mean_frac  # já está agregado na última etapa
+                if var_frac.dim() == 3:
+                    var_last = var_frac[:, -1, :]
+                else:
+                    var_last = var_frac
                 std_last = torch.sqrt(var_last + 1e-8)
 
                 mean_sec = (mean_last * status_pred_window).cpu().numpy()
@@ -2534,8 +2725,13 @@ class TSDiffusion(ODEJumpEncoder):
 
                 mean_b = mean_last.unsqueeze(1)
                 std_b = std_last.unsqueeze(1).clamp(min=1e-6)
-                pdf_norm = (1.0 / (std_b * math.sqrt(2 * math.pi))) * torch.exp(-0.5 * ((grid_fraction.view(1, -1, 1) - mean_b) / std_b) ** 2)
-                pdf_sec = (pdf_norm / max(float(status_pred_window), 1e-6)).cpu().numpy()
+                if mog_pdf is None:
+                    pdf_norm = (1.0 / (std_b * math.sqrt(2 * math.pi))) * torch.exp(
+                        -0.5 * ((grid_fraction.view(1, -1, 1) - mean_b) / std_b) ** 2
+                    )
+                    pdf_sec = (pdf_norm / max(float(status_pred_window), 1e-6)).cpu().numpy()
+                else:
+                    pdf_sec = mog_pdf
 
                 ts_anchor = (
                     df_window.index[-1] if timestamp_col == "index" else df_window[timestamp_col].iloc[-1]
@@ -2549,6 +2745,9 @@ class TSDiffusion(ODEJumpEncoder):
                             "sigma_seconds": float(std_sec[0, s_idx]),
                             "t_grid_seconds": grid_seconds.cpu().numpy().tolist(),
                             "pdf": pdf_sec[0, :, s_idx].tolist(),
+                            "mog_weights": comp_weights[0].tolist() if comp_weights is not None else None,
+                            "mog_means_seconds": comp_means_sec[0, :, s_idx].tolist() if comp_means_sec is not None else None,
+                            "mog_sigmas_seconds": comp_sigmas_sec[0, :, s_idx].tolist() if comp_sigmas_sec is not None else None,
                         }
                     )
 
