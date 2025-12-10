@@ -59,6 +59,38 @@ class DiffTimeEmbedding(nn.Module):
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         # projeta de volta ao espaço de dimensão model_dim
         return self.lin(emb)
+
+def _log_prob_diag_gaussian(z: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    return -0.5 * (math.log(2 * math.pi) + logvar + ((z - mu) ** 2) / torch.exp(logvar))
+
+def _mog_log_prob(pi_logits: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """
+    pi_logits: (B,T,K)
+    mu/logvar: (B,T,K,C)
+    z: (B,T,C)
+    returns log p(z): (B,T)
+    """
+    log_pi = torch.log_softmax(pi_logits, dim=-1)  # (B,T,K)
+    z_exp = z.unsqueeze(2)  # (B,T,1,C)
+    comp_log = _log_prob_diag_gaussian(z_exp, mu, logvar).sum(dim=-1)  # (B,T,K)
+    log_p = torch.logsumexp(log_pi + comp_log, dim=-1)  # (B,T)
+    return log_p
+
+def _sample_mog(pi_logits: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, num_samples: int = 8) -> torch.Tensor:
+    """
+    Returns samples shape (S,B,T,C)
+    """
+    B, T, K, C = mu.shape
+    probs = torch.softmax(pi_logits, dim=-1)
+    cat = torch.distributions.Categorical(probs=probs)
+    comp_idx = cat.sample((num_samples,))  # (S,B,T)
+    comp_idx_exp = comp_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, C)
+    mu_s = mu.unsqueeze(0).expand(num_samples, -1, -1, -1, -1)
+    logvar_s = logvar.unsqueeze(0).expand(num_samples, -1, -1, -1, -1)
+    mu_sel = mu_s.gather(3, comp_idx_exp).squeeze(3)
+    logvar_sel = logvar_s.gather(3, comp_idx_exp).squeeze(3)
+    eps = torch.randn_like(mu_sel)
+    return mu_sel + eps * torch.exp(0.5 * logvar_sel)
     
 class TSDiffusion(ODEJumpEncoder):
     """
@@ -87,7 +119,12 @@ class TSDiffusion(ODEJumpEncoder):
         n_heads_g: int = 4,
         n_layers_g: int = 4,
         log_likelihood: bool = True,
-        sigma_temp: float = 0.7
+        sigma_temp: float = 0.7,
+        mog_components: int = 16,
+        mog_components_tmax: int | None = None,
+        vamp_init_scale: float = 0.1,
+        vamp_logvar_min: float = -8.0,
+        vamp_logvar_max: float = 8.0
         ):
         super().__init__(
             in_channels=in_channels,
@@ -102,6 +139,11 @@ class TSDiffusion(ODEJumpEncoder):
         self.num_steps = num_steps
         self.status_dim = status_dim
         self.sigma_temp = float(sigma_temp)
+        self.mog_components = int(mog_components)
+        self.mog_components_tmax = int(mog_components_tmax) if mog_components_tmax is not None else int(mog_components)
+        self.vamp_init_scale = float(vamp_init_scale)
+        self.vamp_logvar_min = float(vamp_logvar_min)
+        self.vamp_logvar_max = float(vamp_logvar_max)
         self.t_embed = DiffTimeEmbedding(hidden_dim)
         if self.lam[2]>0:
             self.noise_head = nn.Sequential(
@@ -137,10 +179,14 @@ class TSDiffusion(ODEJumpEncoder):
                     nn.Linear(hidden_dim // 2, 1)       # escalar
                 )        
         if self.lam[4] > 0:
-            self.vae_latent = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2)
+            # q(z|x) como MoG no latente (K = mog_components)
+            self.mog_pi_z = nn.Linear(hidden_dim, self.mog_components)
+            self.mog_mu_z = nn.Linear(hidden_dim, self.mog_components * hidden_dim)
+            self.mog_logvar_z = nn.Linear(hidden_dim, self.mog_components * hidden_dim)
+            # prior Vamp no latente
+            self.vamp_log_weights = nn.Parameter(torch.zeros(self.mog_components))
+            self.vamp_pseudo_inputs = nn.Parameter(
+                torch.randn(self.mog_components, 1, hidden_dim) * self.vamp_init_scale
             )
             self.vae_decoder = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
@@ -154,10 +200,12 @@ class TSDiffusion(ODEJumpEncoder):
                 nn.Linear(hidden_dim, in_channels)
             )
         if self.lam[5] > 0 and status_dim > 0:
-            self.vae_tmax_latent = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2)
+            self.mog_pi_zt = nn.Linear(hidden_dim, self.mog_components_tmax)
+            self.mog_mu_zt = nn.Linear(hidden_dim, self.mog_components_tmax * hidden_dim)
+            self.mog_logvar_zt = nn.Linear(hidden_dim, self.mog_components_tmax * hidden_dim)
+            self.vamp_log_weights_tmax = nn.Parameter(torch.zeros(self.mog_components_tmax))
+            self.vamp_pseudo_inputs_tmax = nn.Parameter(
+                torch.randn(self.mog_components_tmax, 1, hidden_dim) * self.vamp_init_scale
             )
             self.vae_tmax_decoder = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim // 2),
@@ -210,6 +258,18 @@ class TSDiffusion(ODEJumpEncoder):
         vae_tmax_mu = None
         vae_tmax_logvar = None
         vae_tmax_logvar_obs = None
+        pi_z = None
+        mu_z = None
+        logvar_z = None
+        prior_pi_z = None
+        prior_mu_z = None
+        prior_logvar_z = None
+        pi_zt = None
+        mu_zt = None
+        logvar_zt = None
+        prior_pi_zt = None
+        prior_mu_zt = None
+        prior_logvar_zt = None
         t = t if t is not None else torch.randint(0, self.num_steps, (x.size(0),), device=x.device)
         if mask_ts is None:
             mask_ts = mask.any(dim=2, keepdim=True).float() if mask is not None else torch.ones_like(x[..., :1])
@@ -252,21 +312,45 @@ class TSDiffusion(ODEJumpEncoder):
             tmax_hat = None
 
         if self.lam[4] > 0:
-            mu_logvar = self.vae_latent(h)
-            vae_mu, vae_logvar = torch.chunk(mu_logvar, 2, dim=-1)
-            std = torch.exp(0.5 * vae_logvar)
-            eps = torch.randn_like(std)
-            z_vae = vae_mu + eps * std
+            pi_z_logits = self.mog_pi_z(h)
+            mu_z = self.mog_mu_z(h).view(h.size(0), h.size(1), self.mog_components, -1)
+            logvar_z = self.mog_logvar_z(h).view(h.size(0), h.size(1), self.mog_components, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            pi_z_soft = torch.softmax(pi_z_logits, dim=-1)
+            mu_mix = (pi_z_soft.unsqueeze(-1) * mu_z).sum(dim=2)
+            var_mix = (pi_z_soft.unsqueeze(-1) * (logvar_z.exp() + mu_z ** 2)).sum(dim=2) - mu_mix ** 2
+            logvar_mix = var_mix.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            z_vae = mu_mix + torch.randn_like(mu_mix) * torch.exp(0.5 * logvar_mix)
+            prior_pi_z_logits = self.mog_pi_z(self.vamp_pseudo_inputs).squeeze(1)
+            prior_mu_z_all = self.mog_mu_z(self.vamp_pseudo_inputs).view(self.mog_components,1,self.mog_components,-1).squeeze(1)
+            prior_logvar_z_all = self.mog_logvar_z(self.vamp_pseudo_inputs).view(self.mog_components,1,self.mog_components,-1).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            idx = torch.arange(self.mog_components, device=h.device)
+            prior_pi_z = torch.log_softmax(self.vamp_log_weights, dim=0)[idx].view(1,1,-1)
+            prior_mu_z = prior_mu_z_all[idx, idx].view(1,1,self.mog_components,-1)
+            prior_logvar_z = prior_logvar_z_all[idx, idx].view(1,1,self.mog_components,-1)
+            vae_mu = mu_mix
+            vae_logvar = logvar_mix
             vae_x = self.vae_decoder(z_vae)
             vae_logvar_obs = self.vae_sigma_head(z_vae).clamp(min=-5.0, max=5.0)
         if self.lam[5] > 0 and ht is not None:
-            mu_logvar_t = self.vae_tmax_latent(ht)
-            vae_tmax_mu, vae_tmax_logvar = torch.chunk(mu_logvar_t, 2, dim=-1)
-            std_t = torch.exp(0.5 * vae_tmax_logvar)
-            eps_t = torch.randn_like(std_t)
-            z_tmax = vae_tmax_mu + eps_t * std_t
-            vae_tmax = self.vae_tmax_decoder(z_tmax)
-            vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax).clamp(min=-5.0, max=5.0)
+            pi_zt_logits = self.mog_pi_zt(ht)
+            mu_zt = self.mog_mu_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1)
+            logvar_zt = self.mog_logvar_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            pi_zt_soft = torch.softmax(pi_zt_logits, dim=-1)
+            mu_mix_t = (pi_zt_soft.unsqueeze(-1) * mu_zt).sum(dim=2)
+            var_mix_t = (pi_zt_soft.unsqueeze(-1) * (logvar_zt.exp() + mu_zt ** 2)).sum(dim=2) - mu_mix_t ** 2
+            logvar_mix_t = var_mix_t.clamp(min=1e-6).log().clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            z_tmax_lat = mu_mix_t + torch.randn_like(mu_mix_t) * torch.exp(0.5 * logvar_mix_t)
+            prior_pi_zt_logits = self.mog_pi_zt(self.vamp_pseudo_inputs_tmax).squeeze(1)
+            prior_mu_zt_all = self.mog_mu_zt(self.vamp_pseudo_inputs_tmax).view(self.mog_components_tmax,1,self.mog_components_tmax,-1).squeeze(1)
+            prior_logvar_zt_all = self.mog_logvar_zt(self.vamp_pseudo_inputs_tmax).view(self.mog_components_tmax,1,self.mog_components_tmax,-1).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            idx_t = torch.arange(self.mog_components_tmax, device=ht.device)
+            prior_pi_zt = torch.log_softmax(self.vamp_log_weights_tmax, dim=0)[idx_t].view(1,1,-1)
+            prior_mu_zt = prior_mu_zt_all[idx_t, idx_t].view(1,1,self.mog_components_tmax,-1)
+            prior_logvar_zt = prior_logvar_zt_all[idx_t, idx_t].view(1,1,self.mog_components_tmax,-1)
+            vae_tmax_mu = mu_mix_t
+            vae_tmax_logvar = logvar_mix_t
+            vae_tmax = self.vae_tmax_decoder(z_tmax_lat)
+            vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax_lat).clamp(min=-5.0, max=5.0)
 
         x_hat = self.decoder(h) if return_x_hat and self.lam[0] > 0 else None
 
@@ -286,6 +370,18 @@ class TSDiffusion(ODEJumpEncoder):
             vae_tmax_logvar,
             vae_logvar_obs,
             vae_tmax_logvar_obs,
+            pi_z_logits if 'pi_z_logits' in locals() else None,
+            mu_z,
+            logvar_z,
+            prior_pi_z if 'prior_pi_z' in locals() else None,
+            prior_mu_z if 'prior_mu_z' in locals() else None,
+            prior_logvar_z if 'prior_logvar_z' in locals() else None,
+            pi_zt_logits if 'pi_zt_logits' in locals() else None,
+            mu_zt if 'mu_zt' in locals() else None,
+            logvar_zt if 'logvar_zt' in locals() else None,
+            prior_pi_zt if 'prior_pi_zt' in locals() else None,
+            prior_mu_zt if 'prior_mu_zt' in locals() else None,
+            prior_logvar_zt if 'prior_logvar_zt' in locals() else None,
         )
 
     def impute(
@@ -411,6 +507,19 @@ class TSDiffusion(ODEJumpEncoder):
         vae_tmax_logvar: torch.Tensor | None = None,
         vae_logvar_obs: torch.Tensor | None = None,
         vae_tmax_logvar_obs: torch.Tensor | None = None,
+        pi_z_logits: torch.Tensor | None = None,
+        mu_z: torch.Tensor | None = None,
+        logvar_z: torch.Tensor | None = None,
+        prior_pi_z: torch.Tensor | None = None,
+        prior_mu_z: torch.Tensor | None = None,
+        prior_logvar_z: torch.Tensor | None = None,
+        pi_zt_logits: torch.Tensor | None = None,
+        mu_zt: torch.Tensor | None = None,
+        logvar_zt: torch.Tensor | None = None,
+        prior_pi_zt: torch.Tensor | None = None,
+        prior_mu_zt: torch.Tensor | None = None,
+        prior_logvar_zt: torch.Tensor | None = None,
+        mask_ts: torch.Tensor | None = None,
         kl_scale: float = 1.0
         
     ):
@@ -496,9 +605,24 @@ class TSDiffusion(ODEJumpEncoder):
             else:
                 vae_recon = ((x - vae_x).pow(2) * mask_vae * cc).sum()
             vae_recon_div = (mask_vae * cc).sum().clamp(min=1.0)
-            vae_kl = -0.5 * torch.sum(1 + vae_logvar - vae_mu.pow(2) - vae_logvar.exp())
-            vae_kl_div = vae_logvar.numel()
-            L5 = vae_recon / vae_recon_div + kl_scale * (vae_kl / vae_kl_div)
+            if pi_z_logits is not None and mu_z is not None and logvar_z is not None and prior_pi_z is not None and prior_mu_z is not None and prior_logvar_z is not None:
+                S_lat = 8
+                z_samples = _sample_mog(pi_z_logits, mu_z, logvar_z, num_samples=S_lat)
+                pi_q = pi_z_logits.unsqueeze(0).expand(S_lat, -1, -1, -1)
+                mu_q = mu_z.unsqueeze(0).expand(S_lat, -1, -1, -1, -1)
+                logvar_q = logvar_z.unsqueeze(0).expand(S_lat, -1, -1, -1, -1)
+                pi_p = prior_pi_z.expand(S_lat, mu_z.size(0), mu_z.size(1), -1)
+                mu_p = prior_mu_z.expand(S_lat, mu_z.size(0), mu_z.size(1), -1, -1)
+                logvar_p = prior_logvar_z.expand(S_lat, mu_z.size(0), mu_z.size(1), -1, -1)
+                log_q = _mog_log_prob(pi_q, mu_q, logvar_q, z_samples)
+                log_p = _mog_log_prob(pi_p, mu_p, logvar_p, z_samples)
+                kl_bt = (log_q - log_p).mean(dim=0)
+                weights_lat = mask_ts.squeeze(-1) if mask_ts is not None else torch.ones_like(kl_bt)
+                vae_kl = (kl_bt * weights_lat).sum()
+                vae_kl_div = weights_lat.sum().clamp(min=1.0)
+                L5 = vae_recon / vae_recon_div + kl_scale * (vae_kl / vae_kl_div)
+            else:
+                L5 = vae_recon / vae_recon_div
             L5_div = torch.tensor(1.0, device=x.device)
         else:
             L5 = torch.tensor(0.0, device=state.device)
@@ -521,9 +645,25 @@ class TSDiffusion(ODEJumpEncoder):
                 vae_recon_t = (base_nll_t * weight_t * mask_vae).sum()
             else:
                 vae_recon_t = ((err_change ** 2 * 1000 + err_no_change ** 2)*mask_vae).sum()
-            vae_kl_t = -0.5 * torch.sum((1 + vae_tmax_logvar - vae_tmax_mu.pow(2) - vae_tmax_logvar.exp()) * mask_vae) 
-            L6_div = mask_vae.sum().clamp(min=1.0)
-            L6 = (vae_recon_t / L6_div) + kl_scale * (vae_kl_t / L6_div)
+            if pi_zt_logits is not None and mu_zt is not None and logvar_zt is not None and prior_pi_zt is not None and prior_mu_zt is not None and prior_logvar_zt is not None:
+                S_tlat = 8
+                z_samples_t = _sample_mog(pi_zt_logits, mu_zt, logvar_zt, num_samples=S_tlat)
+                pi_q_t = pi_zt_logits.unsqueeze(0).expand(S_tlat, -1, -1, -1)
+                mu_q_t = mu_zt.unsqueeze(0).expand(S_tlat, -1, -1, -1, -1)
+                logvar_q_t = logvar_zt.unsqueeze(0).expand(S_tlat, -1, -1, -1, -1)
+                pi_p_t = prior_pi_zt.expand(S_tlat, mu_zt.size(0), mu_zt.size(1), -1)
+                mu_p_t = prior_mu_zt.expand(S_tlat, mu_zt.size(0), mu_zt.size(1), -1, -1)
+                logvar_p_t = prior_logvar_zt.expand(S_tlat, mu_zt.size(0), mu_zt.size(1), -1, -1)
+                log_q_t = _mog_log_prob(pi_q_t, mu_q_t, logvar_q_t, z_samples_t)
+                log_p_t = _mog_log_prob(pi_p_t, mu_p_t, logvar_p_t, z_samples_t)
+                kl_bt_t = (log_q_t - log_p_t).mean(dim=0)
+                weights_lat_t = mask_vae.squeeze(-1)
+                vae_kl_t = (kl_bt_t * weights_lat_t).sum()
+                L6_div = mask_vae.sum().clamp(min=1.0)
+                L6 = (vae_recon_t / L6_div) + kl_scale * (vae_kl_t / L6_div)
+            else:
+                L6_div = mask_vae.sum().clamp(min=1.0)
+                L6 = (vae_recon_t / L6_div)
         else:
             L6 = torch.tensor(0.0, device=state.device)
             L6_div = torch.tensor(1.0, device=state.device)
@@ -760,6 +900,18 @@ class TSDiffusion(ODEJumpEncoder):
                     vae_tmax_logvar,
                     vae_logvar_obs,
                     vae_tmax_logvar_obs,
+                    pi_z_logits,
+                    mu_z,
+                    logvar_z,
+                    prior_pi_z,
+                    prior_mu_z,
+                    prior_logvar_z,
+                    pi_zt_logits,
+                    mu_zt,
+                    logvar_zt,
+                    prior_pi_zt,
+                    prior_mu_zt,
+                    prior_logvar_zt,
                     ) = self.forward(
                     x_masked, timestamps=ts_batch, 
                     static_feats=s, return_x_hat=True, mask=m_train, mask_ts=m_train_ts,test=False,
@@ -790,6 +942,19 @@ class TSDiffusion(ODEJumpEncoder):
                         vae_tmax_logvar,
                         vae_logvar_obs if vae_logvar_obs is not None else None,
                         vae_tmax_logvar_obs,
+                        pi_z_logits,
+                        mu_z,
+                        logvar_z,
+                        prior_pi_z,
+                        prior_mu_z,
+                        prior_logvar_z,
+                        pi_zt_logits,
+                        mu_zt,
+                        logvar_zt,
+                        prior_pi_zt,
+                        prior_mu_zt,
+                        prior_logvar_zt,
+                        m_train_ts,
                         kl_scale=self._kl_scale(ep, kl_start, kl_end, kl_warmup_epochs),
                     )
 
@@ -1155,9 +1320,10 @@ class TSDiffusion(ODEJumpEncoder):
                 else:
                     m_train = m.clone(); m_train[:, -1, :] = 0.0; mask_ts = m_train.any(dim=2, keepdim=True).float()
                 x_masked = x * m_train
-                _, _, _, x_hat, tmax_hat, noise, noise_hat, vae_x, vae_mu, vae_logvar, vae_tmax, vae_tmax_mu, vae_tmax_logvar, vae_logvar_obs, vae_tmax_logvar_obs = self.forward(
+                out = self.forward(
                     x_masked, timestamps=ts_batch, static_feats=s, 
                     return_x_hat=True, mask=m_train, mask_ts=mask_ts, test=False,only_gru=only_gru)
+                _, _, _, x_hat, tmax_hat, noise, noise_hat, vae_x, vae_mu, vae_logvar, vae_tmax, vae_tmax_mu, vae_tmax_logvar, vae_logvar_obs, vae_tmax_logvar_obs, *rest = out
                 
                 offset_state_pred = (p - ts_batch.unsqueeze(-1)).clamp(min=0,max=status_pred_window) / status_pred_window
                 if tmax_hat is None:

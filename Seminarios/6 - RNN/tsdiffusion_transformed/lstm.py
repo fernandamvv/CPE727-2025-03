@@ -286,7 +286,12 @@ class TSDF_LSTM(TSDiffusion):
         log_likelihood: bool = False,
         variational_dropout: float = 0.0,
         use_layernorm: bool = True,
-        sigma_temp: float = 0.7
+        sigma_temp: float = 0.7,
+        mog_components: int = 16,
+        mog_components_tmax: int | None = None,
+        vamp_init_scale: float = 0.1,
+        vamp_logvar_min: float = -8.0,
+        vamp_logvar_max: float = 8.0,
         ):
         super().__init__(
             in_channels=in_channels,
@@ -297,7 +302,12 @@ class TSDF_LSTM(TSDiffusion):
             num_steps=num_steps,
             cost_columns=cost_columns,
             log_likelihood=log_likelihood,
-            sigma_temp=sigma_temp
+            sigma_temp=sigma_temp,
+            mog_components=mog_components,
+            mog_components_tmax=mog_components_tmax,
+            vamp_init_scale=vamp_init_scale,
+            vamp_logvar_min=vamp_logvar_min,
+            vamp_logvar_max=vamp_logvar_max,
         )
         '''self.encoder = nn.Sequential(
             nn.Linear(in_channels*2, hidden_dim),
@@ -348,41 +358,39 @@ class TSDF_LSTM(TSDiffusion):
                 nn.GELU(),
                 nn.Linear(hidden_dim // 2, in_channels),
             )
-            '''if log_likelihood:
-                self.lambda_head = nn.Sequential(
-                    nn.Linear(hidden_dim , hidden_dim // 2),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim // 2, 1)
-                )'''
         if self.lam[4] > 0:
-            self.vae_latent = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2)
+            self.mog_pi_z = nn.Linear(self.state_dim, self.mog_components)
+            self.mog_mu_z = nn.Linear(self.state_dim, self.mog_components * self.state_dim)
+            self.mog_logvar_z = nn.Linear(self.state_dim, self.mog_components * self.state_dim)
+            self.vamp_log_weights = nn.Parameter(torch.zeros(self.mog_components))
+            self.vamp_pseudo_inputs = nn.Parameter(
+                torch.randn(self.mog_components, 1, self.state_dim) * self.vamp_init_scale
             )
             self.vae_decoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.Linear(self.state_dim, self.state_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, in_channels)
+                nn.Linear(self.state_dim, in_channels)
             )
             self.vae_sigma_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.Linear(self.state_dim, self.state_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, in_channels)
+                nn.Linear(self.state_dim, in_channels)
             )
         if self.lam[5] > 0 and status_dim > 0:
-            self.vae_tmax_latent = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2)
+            self.mog_pi_zt = nn.Linear(self.state_dim, self.mog_components_tmax)
+            self.mog_mu_zt = nn.Linear(self.state_dim, self.mog_components_tmax * self.state_dim)
+            self.mog_logvar_zt = nn.Linear(self.state_dim, self.mog_components_tmax * self.state_dim)
+            self.vamp_log_weights_tmax = nn.Parameter(torch.zeros(self.mog_components_tmax))
+            self.vamp_pseudo_inputs_tmax = nn.Parameter(
+                torch.randn(self.mog_components_tmax, 1, self.state_dim) * self.vamp_init_scale
             )
             self.vae_tmax_decoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.Linear(self.state_dim, hidden_dim // 2),
                 nn.GELU(),
                 nn.Linear(hidden_dim // 2, status_dim)
             )
             self.vae_tmax_sigma_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.Linear(self.state_dim, hidden_dim // 2),
                 nn.GELU(),
                 nn.Linear(hidden_dim // 2, status_dim)
             )
@@ -418,6 +426,18 @@ class TSDF_LSTM(TSDiffusion):
         vae_tmax_mu = None
         vae_tmax_logvar = None
         vae_tmax_logvar_obs = None
+        pi_z_logits = None
+        mu_z = None
+        logvar_z = None
+        prior_pi_z = None
+        prior_mu_z = None
+        prior_logvar_z = None
+        pi_zt_logits = None
+        mu_zt = None
+        logvar_zt = None
+        prior_pi_zt = None
+        prior_mu_zt = None
+        prior_logvar_zt = None
         t = t if t is not None else torch.randint(0, self.num_steps, (x.size(0),), device=x.device)
         if mask_ts is None and mask is not None:
             mask_ts = mask.any(dim=2, keepdim=True).float()
@@ -446,21 +466,61 @@ class TSDF_LSTM(TSDiffusion):
             ht = None
             tmax_hat = None
         if self.lam[4] > 0:
-            mu_logvar = self.vae_latent(h)
-            vae_mu, vae_logvar = torch.chunk(mu_logvar, 2, dim=-1)
-            std = torch.exp(0.5 * vae_logvar)
-            eps = torch.randn_like(std)
-            z_vae = vae_mu + eps * std
+            pi_z_logits = self.mog_pi_z(h)
+            mu_z = self.mog_mu_z(h).view(h.size(0), h.size(1), self.mog_components, -1)
+            logvar_z = self.mog_logvar_z(h).view(h.size(0), h.size(1), self.mog_components, -1).clamp(
+                min=self.vamp_logvar_min, max=self.vamp_logvar_max
+            )
+            pi_z_soft = torch.softmax(pi_z_logits, dim=-1)
+            mu_mix = (pi_z_soft.unsqueeze(-1) * mu_z).sum(dim=2)
+            var_mix = (pi_z_soft.unsqueeze(-1) * (logvar_z.exp() + mu_z ** 2)).sum(dim=2) - mu_mix ** 2
+            logvar_mix = var_mix.clamp(min=1e-6).log().clamp(
+                min=self.vamp_logvar_min, max=self.vamp_logvar_max
+            )
+            z_vae = mu_mix + torch.randn_like(mu_mix) * torch.exp(0.5 * logvar_mix)
+            prior_pi_z_logits = self.mog_pi_z(self.vamp_pseudo_inputs).squeeze(1)
+            prior_mu_z_all = self.mog_mu_z(self.vamp_pseudo_inputs).view(
+                self.mog_components, 1, self.mog_components, -1
+            ).squeeze(1)
+            prior_logvar_z_all = self.mog_logvar_z(self.vamp_pseudo_inputs).view(
+                self.mog_components, 1, self.mog_components, -1
+            ).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            idx = torch.arange(self.mog_components, device=h.device)
+            prior_pi_z = torch.log_softmax(self.vamp_log_weights, dim=0)[idx].view(1, 1, -1)
+            prior_mu_z = prior_mu_z_all[idx, idx].view(1, 1, self.mog_components, -1)
+            prior_logvar_z = prior_logvar_z_all[idx, idx].view(1, 1, self.mog_components, -1)
+            vae_mu = mu_mix
+            vae_logvar = logvar_mix
             vae_x = self.vae_decoder(z_vae)
             vae_logvar_obs = self.vae_sigma_head(z_vae).clamp(min=-5.0, max=5.0)
         if self.lam[5] > 0 and ht is not None:
-            mu_logvar_t = self.vae_tmax_latent(ht)
-            vae_tmax_mu, vae_tmax_logvar = torch.chunk(mu_logvar_t, 2, dim=-1)
-            std_t = torch.exp(0.5 * vae_tmax_logvar)
-            eps_t = torch.randn_like(std_t)
-            z_tmax = vae_tmax_mu + eps_t * std_t
-            vae_tmax = self.vae_tmax_decoder(z_tmax)
-            vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax).clamp(min=-5.0, max=5.0)
+            pi_zt_logits = self.mog_pi_zt(ht)
+            mu_zt = self.mog_mu_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1)
+            logvar_zt = self.mog_logvar_zt(ht).view(ht.size(0), ht.size(1), self.mog_components_tmax, -1).clamp(
+                min=self.vamp_logvar_min, max=self.vamp_logvar_max
+            )
+            pi_zt_soft = torch.softmax(pi_zt_logits, dim=-1)
+            mu_mix_t = (pi_zt_soft.unsqueeze(-1) * mu_zt).sum(dim=2)
+            var_mix_t = (pi_zt_soft.unsqueeze(-1) * (logvar_zt.exp() + mu_zt ** 2)).sum(dim=2) - mu_mix_t ** 2
+            logvar_mix_t = var_mix_t.clamp(min=1e-6).log().clamp(
+                min=self.vamp_logvar_min, max=self.vamp_logvar_max
+            )
+            z_tmax_lat = mu_mix_t + torch.randn_like(mu_mix_t) * torch.exp(0.5 * logvar_mix_t)
+            prior_pi_zt_logits = self.mog_pi_zt(self.vamp_pseudo_inputs_tmax).squeeze(1)
+            prior_mu_zt_all = self.mog_mu_zt(self.vamp_pseudo_inputs_tmax).view(
+                self.mog_components_tmax, 1, self.mog_components_tmax, -1
+            ).squeeze(1)
+            prior_logvar_zt_all = self.mog_logvar_zt(self.vamp_pseudo_inputs_tmax).view(
+                self.mog_components_tmax, 1, self.mog_components_tmax, -1
+            ).squeeze(1).clamp(min=self.vamp_logvar_min, max=self.vamp_logvar_max)
+            idx_t = torch.arange(self.mog_components_tmax, device=ht.device)
+            prior_pi_zt = torch.log_softmax(self.vamp_log_weights_tmax, dim=0)[idx_t].view(1, 1, -1)
+            prior_mu_zt = prior_mu_zt_all[idx_t, idx_t].view(1, 1, self.mog_components_tmax, -1)
+            prior_logvar_zt = prior_logvar_zt_all[idx_t, idx_t].view(1, 1, self.mog_components_tmax, -1)
+            vae_tmax_mu = mu_mix_t
+            vae_tmax_logvar = logvar_mix_t
+            vae_tmax = self.vae_tmax_decoder(z_tmax_lat)
+            vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax_lat).clamp(min=-5.0, max=5.0)
 
         x_hat = self.decoder(h) if return_x_hat and self.lam[0]>0 else None
 
@@ -480,5 +540,17 @@ class TSDF_LSTM(TSDiffusion):
             vae_tmax_logvar,
             vae_logvar_obs,
             vae_tmax_logvar_obs,
+            pi_z_logits,
+            mu_z,
+            logvar_z,
+            prior_pi_z,
+            prior_mu_z,
+            prior_logvar_z,
+            pi_zt_logits,
+            mu_zt,
+            logvar_zt,
+            prior_pi_zt,
+            prior_mu_zt,
+            prior_logvar_zt,
         )
     
