@@ -5,31 +5,124 @@ import torch
 import torch.nn.functional as F
 
 
-class GRU(nn.Module):
+def extend_grid(grid, k_extend=0):
+    h = (grid[:, [-1]] - grid[:, [0]]) / (grid.shape[1] - 1)
+    for _ in range(k_extend):
+        grid = torch.cat([grid[:, [0]] - h, grid], dim=1)
+        grid = torch.cat([grid, grid[:, [-1]] + h], dim=1)
+    return grid
+
+
+def B_batch(x, grid, k=0):
+    x = x.unsqueeze(dim=2)
+    grid = grid.unsqueeze(dim=0)
+    if k == 0:
+        value = (x >= grid[:, :, :-1]) * (x < grid[:, :, 1:])
+    else:
+        B_km1 = B_batch(x[:, :, 0], grid=grid[0], k=k - 1)
+        left = (x - grid[:, :, :-(k + 1)]) / (grid[:, :, k:-1] - grid[:, :, :-(k + 1)])
+        right = (grid[:, :, k + 1:] - x) / (grid[:, :, k + 1:] - grid[:, :, 1:(-k)])
+        value = left * B_km1[:, :, :-1] + right * B_km1[:, :, 1:]
+    return torch.nan_to_num(value)
+
+
+def coef2curve(x_eval, grid, coef, k):
+    b_splines = B_batch(x_eval, grid, k=k)
+    return torch.einsum("ijk,jlk->ijl", b_splines, coef.to(b_splines.device))
+
+
+class KANLayer(nn.Module):
     def __init__(
         self,
-        hidden_dim,
-        bi_gru,
-        bi_method,
-        bi_coupled,
-        variational_dropout: float = 0.0
+        in_dim,
+        out_dim,
+        num=5,
+        k=3,
+        noise_scale=0.5,
+        grid_range=(-4, 4),
     ):
         super().__init__()
-        self.bi_gru = bi_gru
-        self.bi_method = bi_method
-        self.bi_coupled = bi_coupled
-        self.hidden_dim=hidden_dim
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.num = int(num)
+        self.k = int(k)
+        base_grid = torch.linspace(grid_range[0], grid_range[1], steps=self.num + 1)
+        grid = base_grid[None, :].expand(self.in_dim, self.num + 1)
+        grid = extend_grid(grid, k_extend=self.k)
+        self.grid = nn.Parameter(grid, requires_grad=False)
+        n_coef = self.grid.shape[1] - self.k - 1
+        coef = (torch.rand(self.in_dim, self.out_dim, n_coef) - 0.5) * (noise_scale / max(self.num, 1))
+        self.coef = nn.Parameter(coef)
+        self.mask = nn.Parameter(torch.ones(self.in_dim, self.out_dim), requires_grad=False)
+
+    def forward(self, x):
+        y = coef2curve(x_eval=x, grid=self.grid, coef=self.coef, k=self.k)
+        y = y * self.mask[None, :, :]
+        return torch.sum(y, dim=1)
+
+
+class KAN(nn.Module):
+    def __init__(self, width, grid=3, k=3, grid_range=(-4, 4)):
+        super().__init__()
+        if len(width) != 2:
+            raise ValueError("Minimal KAN only supports width=[in_dim, out_dim].")
+        self.layer = KANLayer(width[0], width[1], num=grid, k=k, grid_range=grid_range)
+
+    def forward(self, x):
+        return self.layer(x)
+
+
+class SeqKAN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, kan_params=None):
+        super().__init__()
+        if kan_params is None:
+            kan_params = dict(
+                hidden=dict(grid=5, k=3, grid_range=(-4, 4)),
+                output=dict(grid=5, k=3, grid_range=(-4, 4)),
+            )
+        self.hidden_size = int(hidden_size)
+        self.kan_hidden = KAN(
+            width=[input_size + hidden_size, hidden_size],
+            grid=kan_params["hidden"]["grid"],
+            k=kan_params["hidden"]["k"],
+            grid_range=kan_params["hidden"]["grid_range"],
+        )
+        self.kan_out = KAN(
+            width=[hidden_size, output_size],
+            grid=kan_params["output"]["grid"],
+            k=kan_params["output"]["k"],
+            grid_range=kan_params["output"]["grid_range"],
+        )
+
+    def forward(self, x, return_last=False):
+        batch_size, seq_len, _ = x.shape
+        hidden_state = torch.zeros(batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
+        outputs = []
+        for t in range(seq_len):
+            x_t = x[:, t, :]
+            combined = torch.cat((x_t, hidden_state), dim=1)
+            hidden_state = self.kan_hidden(combined)
+            output_t = self.kan_out(hidden_state)
+            outputs.append(output_t)
+        outputs = torch.stack(outputs, dim=1)
+        last = outputs[:, -1, :]
+        return (outputs, last) if return_last else outputs
+
+
+class SeqKANCore(nn.Module):
+    def __init__(self, hidden_dim, input_dim=None, output_dim=None, kan_params=None, variational_dropout=0.0):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        input_dim = self.hidden_dim if input_dim is None else int(input_dim)
+        output_dim = self.hidden_dim if output_dim is None else int(output_dim)
         self.variational_dropout = float(max(0.0, variational_dropout))
-        self.gru = nn.GRUCell(hidden_dim,hidden_dim)
-        if bi_gru:
-            self.gru_bw = nn.GRUCell(hidden_dim,hidden_dim)
-            if bi_method == 'gate':
-                self.bi_gate = nn.Sequential(
-                    nn.Linear(hidden_dim*2,hidden_dim),
-                    nn.Sigmoid()
-                )
-            elif bi_method == 'gru':
-                self.gru_fuser = nn.GRUCell(hidden_dim*2,hidden_dim)
+        self.seqkan = SeqKAN(
+            input_size=input_dim,
+            hidden_size=self.hidden_dim,
+            output_size=output_dim,
+            kan_params=kan_params,
+        )
+
     def _apply_variational_dropout(self, x):
         if not self.training or self.variational_dropout <= 0:
             return x
@@ -38,53 +131,55 @@ class GRU(nn.Module):
         mask = F.dropout(mask, p=self.variational_dropout, training=True)
         return x * mask.unsqueeze(1)
 
-    def forward(self, x):
-        """
-        x  : (B, T, C)
-        ts : (B, T)   segundos unix (normalizados ou não)
-        """
+    def forward(self, x, return_last=False):
         x = self._apply_variational_dropout(x)
-        B, T, _ = x.shape
-        h = torch.zeros(B, self.hidden_dim, device=x.device)
-        states = []
-        if self.bi_gru:
+        return self.seqkan(x, return_last=return_last)
 
-            states_bw = []
-            for i in reversed(range(T)):
-                h = self.gru_bw(x[:, i], h)                                 # jump
-                states_bw.append(h)
-            states_bw.reverse()
-            if not self.bi_coupled:
-                h = torch.zeros(B, self.hidden_dim, device=x.device)
 
-        for i in range(T):
-            h = self.gru(x[:, i], h)                                 # jump
-            states.append(h)
-        if self.bi_gru:
-            states_concat = [torch.cat([f,b],dim=-1) for f,b in zip(states,states_bw)]
-            if self.bi_method == 'concat':
-                states = states_concat
-            elif self.bi_method == 'gate':
-                states_concat = torch.stack(states_concat, dim=1)
-                states = torch.stack(states, dim=1)
-                states_bw = torch.stack(states_bw, dim=1)
-                sigma = self.bi_gate(states_concat)
-                states = sigma * states + (1-sigma) * states_bw
-            elif self.bi_method == 'gru':
-                states_concat = torch.stack(states_concat, dim=1)
-                h = torch.zeros(B, self.hidden_dim, device=x.device)
-                states = []
-                for i in range(T):
-                    h = self.gru_fuser(states_concat[:,i],h)
-                    states.append(h)
-        if self.bi_method != 'gate':
-            H = torch.stack(states, dim=1)   # (B, T, hidden_dim*2)
+class SeqKANEncoder(nn.Module):
+    def __init__(self, in_dim, hidden_dim, kan_params=None, variational_dropout=0.0, use_layernorm: bool = True):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.variational_dropout = float(max(0.0, variational_dropout))
+        self.use_layernorm = use_layernorm
+        self.seqkan = SeqKAN(
+            input_size=self.in_dim,
+            hidden_size=self.hidden_dim,
+            output_size=self.hidden_dim,
+            kan_params=kan_params,
+        )
+        self.norm_x = nn.LayerNorm(self.in_dim) if use_layernorm else None
+        self.norm_H = nn.LayerNorm(self.hidden_dim) if use_layernorm else None
+        if self.in_dim != self.hidden_dim:
+            self.encoder = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim * 4),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim * 4, self.hidden_dim),
+            )
         else:
-            H = states  # (B, T, hidden_dim)
+            self.encoder = None
 
-        return H
+    def _apply_variational_dropout(self, x):
+        if not self.training or self.variational_dropout <= 0:
+            return x
+        B, _, C = x.shape
+        mask = x.new_ones(B, C)
+        mask = F.dropout(mask, p=self.variational_dropout, training=True)
+        return x * mask.unsqueeze(1)
 
-class TS_GRU(ODEJump):
+    def forward(self, x, ts=None, only_gru=False):  # noqa: ARG002
+        x = self._apply_variational_dropout(x)
+        if self.norm_x is not None:
+            x = self.norm_x(x)
+        outputs = self.seqkan(x, return_last=False)
+        if self.norm_H is not None:
+            outputs = self.norm_H(outputs)
+        return outputs if self.encoder is None else self.encoder(outputs)
+
+
+
+class TS_seqKAN(ODEJump):
     def __init__(
         self,
         in_channels: int,
@@ -96,7 +191,9 @@ class TS_GRU(ODEJump):
         bi_gru: bool = False,
         bi_method: str = 'concat',
         bi_coupled: bool = False,
-        variational_dropout: float = 0.0
+        variational_dropout: float = 0.0,
+        kan_params: dict | None = None,
+        direct_x: bool = True
         
     ):
         self.lam = lam
@@ -104,27 +201,34 @@ class TS_GRU(ODEJump):
         self.val_loss = float('inf')
         self.model_dim = hidden_dim
         self.in_channels = in_channels
-        self.encoder = nn.Sequential(
-            nn.Linear(in_channels*2, hidden_dim),
-            nn.ReLU(),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim if not (bi_gru and bi_method=='concat') else hidden_dim * 2, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, in_channels),
-        )
+        self.direct_x = bool(direct_x)
+        if not self.direct_x:
+            self.encoder = nn.Sequential(
+                nn.Linear(in_channels*2, hidden_dim),
+                nn.ReLU(),
+            )
+            self.decoder = nn.Sequential(
+                nn.Linear(hidden_dim if not (bi_gru and bi_method=='concat') else hidden_dim * 2, hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, in_channels),
+            )
+        else:
+            self.encoder = None
+            self.decoder = None
         self.static_dim = static_dim
         if static_dim > 0:
             self.static_proj = nn.Sequential(
-                nn.Linear(static_dim, hidden_dim),
+                nn.Linear(static_dim, in_channels if self.direct_x else hidden_dim),
                 nn.ReLU()
             )
-        self.gru = GRU(
+        if bi_gru:
+            raise ValueError("seqKAN core does not support bi_gru.")
+        self.seqkan = SeqKANCore(
             hidden_dim,
-            bi_gru,
-            bi_method,
-            bi_coupled,
-            variational_dropout=variational_dropout
+            input_dim=in_channels if self.direct_x else hidden_dim,
+            output_dim=in_channels if self.direct_x else hidden_dim,
+            kan_params=kan_params,
+            variational_dropout=variational_dropout,
         )
         # (d) m_b  — probabilidade de observação (Bernoulli) para L4
         self.miss_head = nn.Linear(hidden_dim if not (bi_gru and bi_method=='concat') else hidden_dim * 2, 1)
@@ -151,119 +255,29 @@ class TS_GRU(ODEJump):
             if x_denoised is not None:
                 # aplique gate (treino=True quando model.training)
                 x_fused, _ = self.denoise_gate(x, x_denoised, mask, train_mode=self.training)
-                h_in = torch.cat([x_fused, mask], dim=-1)
+                h_in = x_fused if self.direct_x else torch.cat([x_fused, mask], dim=-1)
             else:
-                h_in = torch.cat([x, mask], dim=-1)
+                h_in = x if self.direct_x else torch.cat([x, mask], dim=-1)
 
-            h = self.encoder(h_in)  # (B,T,hidden_dim)
+            h = h_in if self.direct_x else self.encoder(h_in)  # (B,T,hidden_dim)
         # Static features
         if static_feats is not None and self.static_dim > 0:
             se = self.static_proj(static_feats).unsqueeze(1)  # (b,1,model_dim)
             h = h + se
-        h = self.gru(h)
+        if timestamps is None:
+            raise ValueError("timestamps são obrigatórios para Jump‑ODE Encoder")
+        #tm_e = self.time_encoding(timestamps.to(h.dtype)).to(h.dtype)  # tempo contínuo
+        #h = h + tm_e
+        h = self.seqkan(h)
         state = h
-        return state,self.decoder(state) if return_x_hat else None    
-        
-class GRUEncoder(nn.Module):
-    """
-    Self‑Attentive Jump‑ODE simplificado:
-    - GRUCell executa o *jump* g_ψ na chegada de cada evento (x_i, t_i)
-    - ODEFunc integra h(t) entre eventos.
-    - Self‑attention usa máscara para faltantes (opcional).
-    """
-    def __init__(
-        self,
-        in_dim,
-        hidden_dim,
-        bi_gru,
-        bi_method,
-        bi_coupled,
-        variational_dropout: float = 0.0,
-        use_layernorm: bool = True
-    ):
-        super().__init__()
-        self.bi_gru = bi_gru
-        self.bi_method = bi_method
-        self.bi_coupled = bi_coupled
-        self.hidden_dim = hidden_dim
-        self.in_dim = in_dim
-        self.variational_dropout = float(max(0.0, variational_dropout))
-        self.use_layernorm = use_layernorm
-        self.gru = nn.GRUCell(in_dim, in_dim)
-        self.norm_x = nn.LayerNorm(in_dim) if use_layernorm else None
-        out_dim = in_dim if not (bi_gru and bi_method == 'concat') else in_dim * 2
-        self.norm_H = nn.LayerNorm(out_dim) if use_layernorm else None
-        if bi_gru:
-            self.gru_bw = nn.GRUCell(in_dim, in_dim)
-            if bi_method == 'gate':
-                self.bi_gate = nn.Sequential(
-                    nn.Linear(hidden_dim*2,hidden_dim),
-                    nn.Sigmoid()
-                )
-            elif bi_method == 'gru':
-                self.gru_fuser = nn.GRUCell(hidden_dim*2,hidden_dim)
-
-        if in_dim != hidden_dim:
-            self.encoder=nn.Sequential(
-                nn.Linear(in_dim,hidden_dim*4),
-                nn.GELU(),
-                nn.Linear(hidden_dim*4,hidden_dim)
-            )
- 
-
-    def forward(self, x, ts=None, only_gru=False):  # noqa: ARG002
-        if self.training and self.variational_dropout > 0:
-            B, _, C = x.shape
-            mask = x.new_ones(B, C)
-            mask = F.dropout(mask, p=self.variational_dropout, training=True)
-            x = x * mask.unsqueeze(1)
-        B, T, C = x.shape
-        #eps = 1e-6
-        h = torch.zeros(B, self.in_dim, device=x.device)
-        states = []
-        if self.norm_x is not None:
-            x = self.norm_x(x)
-        if self.bi_gru:
-
-            states_bw = []
-            for i in reversed(range(T)):
-                h = self.gru_bw(x[:, i], h)                                 # jump
-                states_bw.append(h)
-            states_bw.reverse()
-            if not self.bi_coupled:
-                h = torch.zeros(B, self.hidden_dim, device=x.device)
-        for i in range(T):
-
-            # JUMP no evento i (como no esquema original)
-            h = self.gru(x[:, i], h)
-            states.append(h)
-        if self.bi_gru:
-            states_concat = [torch.cat([f,b],dim=-1) for f,b in zip(states,states_bw)]
-            if self.bi_method == 'concat':
-                states = states_concat
-            elif self.bi_method == 'gate':
-                states_concat = torch.stack(states_concat, dim=1)
-                states = torch.stack(states, dim=1)
-                states_bw = torch.stack(states_bw, dim=1)
-                sigma = self.bi_gate(states_concat)
-                states = sigma * states + (1-sigma) * states_bw
-            elif self.bi_method == 'gru':
-                states_concat = torch.stack(states_concat, dim=1)
-                h = torch.zeros(B, self.hidden_dim, device=x.device)
-                states = []
-                for i in range(T):
-                    h = self.gru_fuser(states_concat[:,i],h)
-                    states.append(h)
-
-        if self.bi_method != 'gate':
-            H = torch.stack(states, dim=1)   # (B, T, hidden_dim*2)
+        if return_x_hat:
+            x_hat = state if self.direct_x else self.decoder(state)
         else:
-            H = states  # (B, T, hidden_dim)
-        if self.norm_H is not None:
-            H = self.norm_H(H)
-        return H if self.in_dim == self.hidden_dim else self.encoder(H)
+            x_hat = None
+        return state, x_hat
+        
 
-class TSDF_GRU(TSDiffusion):
+class TSDF_seqKAN(TSDiffusion):
     def __init__(
         self,
         in_channels: int,
@@ -279,8 +293,12 @@ class TSDF_GRU(TSDiffusion):
         log_likelihood: bool = False,
         variational_dropout: float = 0.0,
         use_layernorm: bool = True,
-        sigma_temp: float = 0.7
+        sigma_temp: float = 0.7,
+        kan_params: dict | None = None,
+        direct_x: bool = True
         ):
+        if bi_gru:
+            raise ValueError("seqKAN core does not support bi_gru.")
         super().__init__(        
             in_channels=in_channels,
             hidden_dim=hidden_dim,
@@ -292,16 +310,21 @@ class TSDF_GRU(TSDiffusion):
             log_likelihood=log_likelihood,
             sigma_temp=sigma_temp
         )
-        self.encoder = nn.Sequential(
-            nn.Linear(in_channels*2, hidden_dim),
-            nn.ReLU(),
-        )
-        self.state_dim = hidden_dim if not (bi_gru and bi_method == 'concat') else hidden_dim * 2
+        self.direct_x = bool(direct_x)
+        if not self.direct_x:
+            self.encoder = nn.Sequential(
+                nn.Linear(in_channels*2, hidden_dim),
+                nn.ReLU(),
+            )
+            self.state_dim = hidden_dim
+        else:
+            self.encoder = None
+            self.state_dim = in_channels
 
         self.static_dim = static_dim
         if static_dim > 0:
             self.static_proj = nn.Sequential(
-                nn.Linear(static_dim, hidden_dim),
+                nn.Linear(static_dim, in_channels if self.direct_x else hidden_dim),
                 nn.ReLU()
             )
 
@@ -311,14 +334,11 @@ class TSDF_GRU(TSDiffusion):
                 nn.ReLU(),
                 nn.Linear(hidden_dim // 2, status_dim)
             )
-            self.encoder_ode_tmax = GRUEncoder(
-                hidden_dim,
-                hidden_dim,
-                bi_gru,
-                bi_method,
-                bi_coupled,
+            self.encoder_ode_tmax = SeqKANEncoder(
+                self.state_dim,
+                self.state_dim,
+                kan_params=kan_params,
                 variational_dropout=variational_dropout,
-                use_layernorm=use_layernorm
             )
             if self.log_likelihood:
                 self.lambda_tmax_head = nn.Sequential(
@@ -330,14 +350,11 @@ class TSDF_GRU(TSDiffusion):
         if self.lam[3] > 0.0:  
             self.miss_head = nn.Linear(self.state_dim, 1)
         if self.lam[0] > 0.0 or self.lam[4] > 0.0:
-            self.encoder_ode_x = GRUEncoder(
-                hidden_dim,
-                hidden_dim,
-                bi_gru,
-                bi_method,
-                bi_coupled,
+            self.encoder_ode_x = SeqKANEncoder(
+                self.state_dim,
+                self.state_dim,
+                kan_params=kan_params,
                 variational_dropout=variational_dropout,
-                use_layernorm=use_layernorm
             )
             self.decoder = nn.Sequential(
                 nn.Linear(self.state_dim, hidden_dim // 2),
@@ -397,6 +414,7 @@ class TSDF_GRU(TSDiffusion):
         test: bool=True,
         only_gru: bool = False
     ) -> torch.Tensor:
+        only_gru = True
         """
         Args:
             x: (batch, seq_len, in_channels) - dados ruidosos.
@@ -419,7 +437,10 @@ class TSDF_GRU(TSDiffusion):
             mask_ts = mask.any(dim=2, keepdim=True).float()
         # Embedding de entrada
         if not already_latent:
-            h = self.encoder(torch.cat([x, mask], dim=-1))
+            if self.direct_x:
+                h = x
+            else:
+                h = self.encoder(torch.cat([x, mask], dim=-1))
             if not test and self.lam[1]>0:
                 noise = torch.randn_like(h) * mask_ts
                 ab = self.alpha_bar[t].view(-1, 1, 1)
@@ -459,7 +480,10 @@ class TSDF_GRU(TSDiffusion):
             vae_tmax = self.vae_tmax_decoder(z_tmax)
             vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax).clamp(min=-5.0, max=5.0)
 
-        x_hat = self.decoder(h) if return_x_hat and self.lam[0]>0 else None
+        if return_x_hat and self.lam[0] > 0:
+            x_hat = h if self.direct_x else self.decoder(h)
+        else:
+            x_hat = None
 
         return (
             h,

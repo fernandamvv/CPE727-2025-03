@@ -11,6 +11,13 @@ from torch.utils.data import DataLoader, Subset
 from sklearn.preprocessing import RobustScaler
 
 max_drop = 0.3
+LOGVAR_MIN = -5.0
+LOGVAR_MAX = 5.0
+LOGVAR_REG_LAMBDA = 1e-1
+LOGVAR_TARGET = 0.0
+
+def _bounded_logvar(raw, min_logvar: float = LOGVAR_MIN, max_logvar: float = LOGVAR_MAX):
+    return min_logvar + (max_logvar - min_logvar) * torch.sigmoid(raw)
 
 def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
     """
@@ -258,7 +265,7 @@ class TSDiffusion(ODEJumpEncoder):
             eps = torch.randn_like(std)
             z_vae = vae_mu + eps * std
             vae_x = self.vae_decoder(z_vae)
-            vae_logvar_obs = self.vae_sigma_head(z_vae).clamp(min=-5.0, max=5.0)
+            vae_logvar_obs = _bounded_logvar(self.vae_sigma_head(z_vae))
         if self.lam[5] > 0 and ht is not None:
             mu_logvar_t = self.vae_tmax_latent(ht)
             vae_tmax_mu, vae_tmax_logvar = torch.chunk(mu_logvar_t, 2, dim=-1)
@@ -266,7 +273,7 @@ class TSDiffusion(ODEJumpEncoder):
             eps_t = torch.randn_like(std_t)
             z_tmax = vae_tmax_mu + eps_t * std_t
             vae_tmax = self.vae_tmax_decoder(z_tmax)
-            vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax).clamp(min=-5.0, max=5.0)
+            vae_tmax_logvar_obs = _bounded_logvar(self.vae_tmax_sigma_head(z_tmax))
 
         x_hat = self.decoder(h) if return_x_hat and self.lam[0] > 0 else None
 
@@ -490,7 +497,7 @@ class TSDiffusion(ODEJumpEncoder):
         if self.lam[4] > 0 and vae_x is not None and vae_mu is not None and vae_logvar is not None:
             mask_vae = mask
             if vae_logvar_obs is not None:
-                logvar_obs = (vae_logvar_obs + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                logvar_obs = _bounded_logvar(vae_logvar_obs + math.log(self.sigma_temp))
                 nll_obs = 0.5 * (logvar_obs + ((x - vae_x) ** 2) / torch.exp(logvar_obs) + math.log(2 * math.pi))
                 vae_recon = (nll_obs * mask_vae * cc).sum()
             else:
@@ -499,6 +506,9 @@ class TSDiffusion(ODEJumpEncoder):
             vae_kl = -0.5 * torch.sum(1 + vae_logvar - vae_mu.pow(2) - vae_logvar.exp())
             vae_kl_div = vae_logvar.numel()
             L5 = vae_recon / vae_recon_div + kl_scale * (vae_kl / vae_kl_div)
+            if vae_logvar_obs is not None:
+                logvar_reg = ((logvar_obs - LOGVAR_TARGET) ** 2).mean()
+                L5 = L5 + LOGVAR_REG_LAMBDA * logvar_reg
             L5_div = torch.tensor(1.0, device=x.device)
         else:
             L5 = torch.tensor(0.0, device=state.device)
@@ -514,7 +524,7 @@ class TSDiffusion(ODEJumpEncoder):
             err_no_change = err * (1-changing_state)
             err_change = err * changing_state
             if vae_tmax_logvar_obs is not None:
-                logvar_obs_t = (vae_tmax_logvar_obs + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                logvar_obs_t = _bounded_logvar(vae_tmax_logvar_obs + math.log(self.sigma_temp))
                 base_nll_t = 0.5 * (logvar_obs_t + (err ** 2) / torch.exp(logvar_obs_t) + math.log(2 * math.pi))
                 base_nll_t = base_nll_t.clamp_min(0.0)
                 weight_t = 1.0 + (100.0 - 1.0) * changing_state
@@ -524,6 +534,9 @@ class TSDiffusion(ODEJumpEncoder):
             vae_kl_t = -0.5 * torch.sum((1 + vae_tmax_logvar - vae_tmax_mu.pow(2) - vae_tmax_logvar.exp()) * mask_vae) 
             L6_div = mask_vae.sum().clamp(min=1.0)
             L6 = (vae_recon_t / L6_div) + kl_scale * (vae_kl_t / L6_div)
+            if vae_tmax_logvar_obs is not None:
+                logvar_reg_t = ((logvar_obs_t - LOGVAR_TARGET) ** 2).mean()
+                L6 = L6 + LOGVAR_REG_LAMBDA * logvar_reg_t
         else:
             L6 = torch.tensor(0.0, device=state.device)
             L6_div = torch.tensor(1.0, device=state.device)
@@ -717,6 +730,10 @@ class TSDiffusion(ODEJumpEncoder):
             epoch_start = time.time()
             self.train()
             total_train = [[0.0, 0.0] for _ in range(6)]  # L1..L6
+            vae_logvar_sum = 0.0
+            vae_logvar_count = 0
+            vae_logvar_min = None
+            vae_logvar_max = None
             scaler = torch.amp.GradScaler()
             for batch in train_loader:
                 s = None
@@ -764,6 +781,16 @@ class TSDiffusion(ODEJumpEncoder):
                     x_masked, timestamps=ts_batch, 
                     static_feats=s, return_x_hat=True, mask=m_train, mask_ts=m_train_ts,test=False,
                     only_gru=only_gru)
+                if vae_logvar_obs is not None:
+                    v = vae_logvar_obs.detach()
+                    v_min = float(v.min().item())
+                    v_max = float(v.max().item())
+                    v_sum = float(v.sum().item())
+                    v_count = int(v.numel())
+                    vae_logvar_sum += v_sum
+                    vae_logvar_count += v_count
+                    vae_logvar_min = v_min if vae_logvar_min is None else min(vae_logvar_min, v_min)
+                    vae_logvar_max = v_max if vae_logvar_max is None else max(vae_logvar_max, v_max)
                 with torch.amp.autocast(device_type='cuda'):
 
                     loss, L1, L2, L3, L4, L5, L6 = self._compute_loss(
@@ -813,6 +840,7 @@ class TSDiffusion(ODEJumpEncoder):
             train_L4 = total_train[3][0] / max(total_train[3][1], 1.0)
             train_L5 = total_train[4][0] / max(total_train[4][1], 1.0)
             train_L6 = total_train[5][0] / max(total_train[5][1], 1.0)
+            vae_logvar_mean = (vae_logvar_sum / max(vae_logvar_count, 1)) if vae_logvar_count > 0 else None
 
             if validate and val_loader is not None:
                 val_metrics = self.test_model(val_loader, y_seq=y_win[val_idx], 
@@ -824,6 +852,10 @@ class TSDiffusion(ODEJumpEncoder):
                     f"Epoch {ep}/{epochs} | "
                     f"Train(sampled) L1:{train_L1:.6f} L2:{train_L2:.6f} L3:{train_L3:.6f}  L4:{train_L4:.6f} L5:{train_L5:.6f} L6:{train_L6:.6f} | "
                 ]
+                if vae_logvar_count > 0:
+                    val_parts.append(
+                        f"logvar[min/mean/max]:{vae_logvar_min:.3f}/{vae_logvar_mean:.3f}/{vae_logvar_max:.3f} | "
+                    )
                 if self.lam[0] > 0:
                     val_parts.append(
                         f"Val macro:{val_metrics['macro_mse']:.6f} ± {val_metrics['macro_se']:.6f} | "
@@ -856,6 +888,10 @@ class TSDiffusion(ODEJumpEncoder):
                 print(
                     f"Epoch {ep}/{epochs} | "
                     f"Train(sampled) L1:{train_L1:.6f} L2:{train_L2:.6f} L3:{train_L3:.6f} L4:{train_L4:.6f} L5:{train_L5:.6f} L6:{train_L6:.6f} | "
+                    + (
+                        f"logvar[min/mean/max]:{vae_logvar_min:.3f}/{vae_logvar_mean:.3f}/{vae_logvar_max:.3f} | "
+                        if vae_logvar_count > 0 else ""
+                    )
                 )
 
             # teste fixo e ES
@@ -875,6 +911,9 @@ class TSDiffusion(ODEJumpEncoder):
                 "train_L5": float(train_L5),
                 "train_L6": float(train_L6),
                 "epoch_time": float(epoch_time),
+                "vae_logvar_obs_min": float(vae_logvar_min) if vae_logvar_count > 0 else None,
+                "vae_logvar_obs_mean": float(vae_logvar_mean) if vae_logvar_count > 0 else None,
+                "vae_logvar_obs_max": float(vae_logvar_max) if vae_logvar_count > 0 else None,
             })
             yield epoch_metrics
             test_parts = []
@@ -1204,7 +1243,7 @@ class TSDiffusion(ODEJumpEncoder):
                 nobs_v_bt = nobs_v_bt.detach().cpu().numpy()
                 mu_v = vae_x
                 logvar_v = vae_logvar_obs if vae_logvar_obs is not None else torch.zeros_like(mu_v)
-                logvar_v = (logvar_v + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                logvar_v = _bounded_logvar(logvar_v + math.log(self.sigma_temp))
                 sigma_v = torch.exp(0.5 * logvar_v)
                 # KL por amostra (soma sobre dims)
                 if vae_mu is not None and vae_logvar is not None:
@@ -1239,7 +1278,7 @@ class TSDiffusion(ODEJumpEncoder):
                 nobs_vt_bt = nobs_vt_bt.detach().cpu().numpy()
                 mu_vt = offset_vae_tmax * changing_state * mask_tmax
                 logvar_vt = vae_tmax_logvar_obs if vae_tmax_logvar_obs is not None else torch.zeros_like(mu_vt)
-                logvar_vt = (logvar_vt + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                logvar_vt = _bounded_logvar(logvar_vt + math.log(self.sigma_temp))
                 sigma_vt = torch.exp(0.5 * logvar_vt) * changing_state * mask_tmax
                 if vae_tmax_mu is not None and vae_tmax_logvar is not None:
                     kl_vt_per_b = -0.5 * (1 + vae_tmax_logvar - vae_tmax_mu.pow(2) - vae_tmax_logvar.exp()).sum(dim=(1, 2))
@@ -2194,7 +2233,7 @@ class TSDiffusion(ODEJumpEncoder):
                 if self.lam[5] > 0 and vae_tmax_mu is not None:
                     mean_frac = self.vae_tmax_decoder(vae_tmax_mu)
                     logvar_obs = self.vae_tmax_sigma_head(vae_tmax_mu)
-                    logvar_obs = (logvar_obs + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                    logvar_obs = _bounded_logvar(logvar_obs + math.log(self.sigma_temp))
                     var_frac = torch.exp(logvar_obs)
                 elif self.status_dim > 0 and self.log_likelihood and hasattr(self, "lambda_tmax_head") and state_tmax is not None:
                     lam_t_tmax = F.softplus(self.lambda_tmax_head(state_tmax)).clamp(min=1 / (2 * math.pi), max=2 * math.pi)
@@ -2349,7 +2388,7 @@ class TSDiffusion(ODEJumpEncoder):
                 if self.lam[5] > 0 and vae_tmax_mu is not None:
                     mean_frac = self.vae_tmax_decoder(vae_tmax_mu)
                     logvar_obs = self.vae_tmax_sigma_head(vae_tmax_mu)
-                    logvar_obs = (logvar_obs + math.log(self.sigma_temp)).clamp(min=-5.0, max=5.0)
+                    logvar_obs = _bounded_logvar(logvar_obs + math.log(self.sigma_temp))
                     var_frac = torch.exp(logvar_obs)
                 elif self.status_dim > 0 and self.log_likelihood and hasattr(self, "lambda_tmax_head") and state_tmax is not None:
                     lam_t_tmax = F.softplus(self.lambda_tmax_head(state_tmax)).clamp(min=1 / (2 * math.pi), max=2 * math.pi)
