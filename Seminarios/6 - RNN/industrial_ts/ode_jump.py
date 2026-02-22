@@ -334,13 +334,13 @@ class ODEJump(nn.Module):
         L1 = sse.sum()
         # ----- L4 (máscara) -----
         # máscara binária: 1 se ao menos um canal está presente no timestep
-                # (B, T, 1)
-        m_t = mask_train.any(dim=2, keepdim=True).float()              # (B,T,1)
+        # (B, T, 1)
+        m_t = mask_train.any(dim=2, keepdim=True).float()
         #mb_pred = torch.sigmoid().clamp(1e-4, 1-1e-4)  # (B, T, 1)
         L4 = torch.nn.functional.binary_cross_entropy_with_logits(self.miss_head(state), m_t, reduction='sum')
         L1_div = nobs.sum().clamp(min=1.0)
         L4_div = float(m_t.numel())
-        loss = self.lam[0]*L1/L1_div + self.lam[1]*L4/L4_div
+        loss = self.lam[0] * L1 / L1_div + self.lam[1] * L4 / L4_div
 
         return (
             loss,
@@ -360,7 +360,8 @@ class ODEJump(nn.Module):
         return x
 
         # ---------- Novo método: test_model (macro/micro e por estado) ----------
-    def test_model(self, loader: DataLoader, y_seq, all_groups=None, static=False, denoised=False):
+    def test_model(self, loader: DataLoader, y_seq, all_groups=None, static=False, denoised=False,
+                   x_max: float | None = None, x_min: float | None = None):
         """
         Avalia reconstrução por janela e retorna:
         - micro_mse, micro_se            (ponderado por nobs, todas as janelas)
@@ -412,6 +413,10 @@ class ODEJump(nn.Module):
                     elif self.cost_columns is not None:
                         cc = batch[3]                    
                 x, ts_batch, m, cc = x.to(device), ts_batch.to(device), m.to(device), cc.to(device)
+                if x_min is not None:
+                    x = torch.maximum(x, x.new_tensor(x_min))
+                if x_max is not None:
+                    x = torch.minimum(x, x.new_tensor(x_max))
                 if s is not None: s = s.to(device)
                 if x_denoised is not None: x_denoised = x_denoised.to(device)
 
@@ -638,7 +643,7 @@ class ODEJump(nn.Module):
         return TensorDataset(*args)  # retorna Dataset com (seqs, ts_seqs, mask_seqs, stat_seqs, seqs_denoised) 
 
     @staticmethod
-    def scale_tensor(t_train,t_all, Scaler = RobustScaler):
+    def scale_tensor(t_train, t_all, Scaler=RobustScaler, return_scaler: bool = False):
         scaler = Scaler()
         B, T, C = t_train.shape
         t_2d = t_train.numpy().reshape(B * T, C)
@@ -646,7 +651,8 @@ class ODEJump(nn.Module):
         N, T, C = t_all.shape
         t_all = t_all.numpy().reshape(N * T, C)
         t_all_scaled = scaler.transform(t_all).reshape(N, T, C)        
-        return torch.tensor(t_all_scaled, dtype=torch.float32)
+        t_all_scaled = torch.tensor(t_all_scaled, dtype=torch.float32)
+        return (t_all_scaled, scaler) if return_scaler else t_all_scaled
 
     # ---------- Novo método: train_cognite ----------
     def train_cognite(self,
@@ -669,8 +675,17 @@ class ODEJump(nn.Module):
         fixed_test_idx: np.ndarray | None = None,
         seed_split: int = 42,
         df_denoised: pd.DataFrame | None = None,
-        optimizer = None
+        optimizer = None,
+        x_max: float | None = None,
+        x_min: float | None = None
     ):
+        def _clip_batch_x(x: torch.Tensor) -> torch.Tensor:
+            if x_min is not None:
+                x = torch.maximum(x, x.new_tensor(x_min))
+            if x_max is not None:
+                x = torch.minimum(x, x.new_tensor(x_max))
+            return x
+
         device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         df_sorted = df if timestamp_col == "index" else df.sort_values(timestamp_col).reset_index(drop=True)
 
@@ -775,6 +790,7 @@ class ODEJump(nn.Module):
                     elif self.cost_columns is not None:
                         cc = batch[3]                    
                 x, ts_batch, m, cc = x.to(device), ts_batch.to(device), m.to(device), cc.to(device)
+                x = _clip_batch_x(x)
                 if s is not None: s = s.to(device)
                 if x_denoised is not None: x_denoised = x_denoised.to(device)
                 m_train = m.clone(); m_train[:, -1, :] = 0.0
@@ -799,7 +815,8 @@ class ODEJump(nn.Module):
 
             if validate and val_loader is not None:
                 val_metrics = self.test_model(val_loader, y_seq=y_win[val_idx], all_groups=all_groups, 
-                                              static=static_features_cols, denoised=df_denoised is not None)
+                                              static=static_features_cols, denoised=df_denoised is not None,
+                                              x_max=x_max, x_min=x_min)
                 yield val_metrics
                 print(
                     f"Epoch {ep}/{epochs} | "
@@ -816,7 +833,8 @@ class ODEJump(nn.Module):
             # teste fixo e ES
             test_metrics = self.test_model(
                 test_loader, y_seq=y_win[test_idx], all_groups=all_groups, 
-                static=static_features_cols, denoised=df_denoised is not None
+                static=static_features_cols, denoised=df_denoised is not None,
+                x_max=x_max, x_min=x_min
                 )
             if not validate:
                 yield test_metrics
@@ -838,7 +856,8 @@ class ODEJump(nn.Module):
         # --- Resultado final no teste fixo
         final_metrics = self.test_model(
             test_loader, y_seq=y_win[test_idx], all_groups=all_groups, 
-            static=static_features_cols, denoised=df_denoised is not None
+            static=static_features_cols, denoised=df_denoised is not None,
+            x_max=x_max, x_min=x_min
             )
         print(
             "TEST RESULTS | "

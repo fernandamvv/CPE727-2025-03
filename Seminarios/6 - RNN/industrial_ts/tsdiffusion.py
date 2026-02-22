@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import time
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 from sklearn.preprocessing import RobustScaler
 
 max_drop = 0.3
@@ -571,17 +571,17 @@ class TSDiffusion(ODEJumpEncoder):
             (float(L6.item()), float(L6_div.item()))
             )
     
-    def _make_random_mask(self,x,ts_batch,m,device):
-        t_mask = torch.randint(0, self.num_steps, (x.size(0),), device=device)
-        t_mask_ts = torch.randint(0, self.num_steps, (x.size(0),), device=device)
+    def _make_random_mask(self, x, ts_batch, m, device, generator=None):
+        t_mask = torch.randint(0, self.num_steps, (x.size(0),), device=device, generator=generator)
+        t_mask_ts = torch.randint(0, self.num_steps, (x.size(0),), device=device, generator=generator)
         # 2) probabilidade de *extra-missing* cresce com t
         p_drop_t = (t_mask.float() / (self.num_steps - 1)) * max_drop   # (B,)
         p_drop_t = p_drop_t.view(-1, 1, 1)                         # broadcast
         p_drop_ts = (t_mask_ts.float() / (self.num_steps - 1)) * max_drop   # (B,)
         p_drop_ts = p_drop_ts.view(-1, 1)                         # broadcast
 
-        rand_mask = (torch.rand_like(m) > p_drop_t).float()
-        rand_mask_ts = (torch.rand_like(ts_batch) > p_drop_ts).unsqueeze(-1).float()
+        rand_mask = (torch.rand(m.shape, device=device, generator=generator) > p_drop_t).float()
+        rand_mask_ts = (torch.rand(ts_batch.shape, device=device, generator=generator) > p_drop_ts).unsqueeze(-1).float()
         rand_mask_ts[:,-1,0]=0
         return m * rand_mask * rand_mask_ts
 
@@ -618,38 +618,80 @@ class TSDiffusion(ODEJumpEncoder):
         lr_t: float = 1.5e-4,
         only_gru: bool = False,
         reconstruction_test: bool = True,
+        eval_mask_seed: int | None = None,
+        debug_batch_stats: bool = False,
+        debug_batch_stats_names: list[str] | None = None,
+        debug_scaler: bool = False,
+        grad_clip_max_norm: float = 1.0,
         optimizer_name: str = 'adamw',
         optimizer_params: dict = {'weight_decay': 1e-4},
         warmup_steps: int = 0,
         min_lr_factor: float = 0.1,
+        lr_scheduler: str = "plateau",
+        plateau_monitor: str = "val_micro",
+        plateau_factor: float = 0.5,
+        plateau_patience: int = 8,
+        plateau_min_lr: float = 1e-6,
+        spline_soft_freeze_epoch: int = 36,
+        spline_soft_freeze_factor: float = 0.02,
+        aux_lr_factor: float = 0.5,
+        aux_spline_reg: float = 0.0,
+        spline_param_keywords: tuple[str, ...] = ("kan_", "act_fun", "coef", "grid", "spline"),
         lambda1: float = 0.0,
         rebuild: bool = True,
         kl_start: float = 0.001,
         kl_end: float = 1.0,
         kl_warmup_epochs: int = 50,
+        save_best_ckpt: bool = True,
         train_fraction: float = 0.6,
-        weight_tmax: float = 1.0
+        weight_tmax: float = 1.0,
+        x_max: float | None = None,
+        x_min: float | None = None
     ):
+        def _clip_batch_x(x: torch.Tensor) -> torch.Tensor:
+            if x_min is not None:
+                x = torch.maximum(x, x.new_tensor(x_min))
+            if x_max is not None:
+                x = torch.minimum(x, x.new_tensor(x_max))
+            return x
+
         delta_pred_window = np.float32(status_pred_window / TS_SPAN)
         # exemplo para ODEJumpEncoder: ajuste nomes conforme sua classe
         transformer_params = []
+        spline_params = []
+        aux_params = []
         base_params = []
         for n,p in self.named_parameters():
             if "transformer" in n or "encoder_ode" in n:  # bloco de atenção
                 transformer_params.append(p)
+                continue
+            if "aux" in n:
+                aux_params.append(p)
+                continue
+            if any(k in n for k in spline_param_keywords):
+                spline_params.append(p)
             else:
                 base_params.append(p)
         base_params = {'params': base_params}
+        spline_params = {'params': spline_params, 'name': 'spline'}
+        aux_params = {'params': aux_params, 'name': 'spline_aux'}
         transformer_params = {'params': transformer_params}
         base_params.update(optimizer_params)
+        spline_params.update(optimizer_params)
+        aux_params.update(optimizer_params)
         transformer_params.update(optimizer_params)
         base_params['lr'] = lr
+        spline_params['lr'] = lr
+        aux_params['lr'] = lr * aux_lr_factor
         transformer_params['lr'] = lr_t
 
-        optimizer = self.optimizers[optimizer_name]([
-            base_params,
-            transformer_params,
-        ], betas=(0.9, 0.98))
+        param_groups = [base_params, spline_params, transformer_params]
+        if len(aux_params["params"]) > 0:
+            param_groups.insert(2, aux_params)
+        optimizer = self.optimizers[optimizer_name](
+            param_groups,
+            betas=(0.9, 0.98)
+        )
 
 
 
@@ -658,14 +700,14 @@ class TSDiffusion(ODEJumpEncoder):
 
         # Dataset (sem y) e rótulos de grupo por janela (para split/oversampling/relato)
         ds = self._make_dataset(
-            df_sorted, 
-            timestamp_col, 
-            window_size, 
-            feature_cols, 
-            static_features_cols, 
+            df_sorted,
+            timestamp_col,
+            window_size,
+            feature_cols,
+            static_features_cols,
             window_step,
             predict_state_cols=predict_state_cols
-            )
+        )
         y_win, _starts = self._states_from_df_windows(df_sorted, states_col, window_size, window_step, label_at)
         all_groups = np.unique(y_win)
 
@@ -689,7 +731,14 @@ class TSDiffusion(ODEJumpEncoder):
             train_idx, val_idx, test_idx = self._split_by_group_proportions(
                 y_win, validate=validate, train_frac=train_frac, val_frac=val_frac, test_frac=test_frac, seed=seed_split
             )
-        x_all_scaled = self.scale_tensor(ds.tensors[0][train_idx], ds.tensors[0])
+        if debug_scaler:
+            x_all_scaled, data_scaler = self.scale_tensor(
+                ds.tensors[0][train_idx], ds.tensors[0], return_scaler=True
+            )
+            print("RobustScaler center_ (train):", data_scaler.center_)
+            print("RobustScaler scale_  (train):", data_scaler.scale_)
+        else:
+            x_all_scaled = self.scale_tensor(ds.tensors[0][train_idx], ds.tensors[0])
         ds.tensors = (torch.tensor(x_all_scaled, dtype=torch.float32),) + ds.tensors[1:]
         # --- Oversampling APENAS no treino
         train_sampler = self._make_weighted_sampler_from_classes(y_win[train_idx]) if len(train_idx) else None
@@ -714,19 +763,35 @@ class TSDiffusion(ODEJumpEncoder):
         print("GRUPOS (test): ", _count(y_win[test_idx]))
 
         # --- Treino + ES sempre no TESTE
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return (step + 1) / max(warmup_steps, 1)  # linear warmup
-            # cosine decay até min_lr_factor
-            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-            cosine = 0.5 * (1 + math.cos(math.pi * progress))
-            return min_lr_factor + (1 - min_lr_factor) * cosine
         self.to(device)
         best_score = float("inf"); best_epoch = 0; wait = patience
+        best_ckpt = None
         steps_per_epoch = max(len(train_loader), 1)
         total_steps     = max(epochs * steps_per_epoch, 1)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        if lr_scheduler == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=plateau_factor,
+                patience=plateau_patience,
+                min_lr=plateau_min_lr,
+            )
+        elif lr_scheduler == "none":
+            scheduler = None
+        else:
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    return (step + 1) / max(warmup_steps, 1)  # linear warmup
+                # cosine decay até min_lr_factor
+                progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+                cosine = 0.5 * (1 + math.cos(math.pi * progress))
+                return min_lr_factor + (1 - min_lr_factor) * cosine
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         for ep in range(1, epochs + 1):
+            if spline_soft_freeze_epoch is not None and ep == spline_soft_freeze_epoch:
+                for group in optimizer.param_groups:
+                    if group.get('name') == 'spline':
+                        group['lr'] *= spline_soft_freeze_factor
             epoch_start = time.time()
             self.train()
             total_train = [[0.0, 0.0] for _ in range(6)]  # L1..L6
@@ -735,6 +800,10 @@ class TSDiffusion(ODEJumpEncoder):
             vae_logvar_min = None
             vae_logvar_max = None
             scaler = torch.amp.GradScaler()
+            printed_batch_stats = False
+            if debug_scaler and ep in (1, 2):
+                print(f"[Epoch {ep}] RobustScaler center_ (train):", data_scaler.center_)
+                print(f"[Epoch {ep}] RobustScaler scale_  (train):", data_scaler.scale_)
             for batch in train_loader:
                 s = None
                 p = None
@@ -750,6 +819,7 @@ class TSDiffusion(ODEJumpEncoder):
                 if predict_state_cols is not None:
                     p = batch[-1]
                 x, ts_batch, m, cc = x.to(device), ts_batch.to(device), m.to(device), cc.to(device)
+                x = _clip_batch_x(x)
                 if s is not None: s = s.to(device)
                 if p is not None: p = p.to(device)
 
@@ -760,6 +830,33 @@ class TSDiffusion(ODEJumpEncoder):
                     m_train[:,-1,:]=0
                 m_train_ts = m_train.any(dim=2, keepdim=True).float()
                 x_masked = x * m_train
+                if debug_batch_stats and not printed_batch_stats:
+                    x_scaled = x_masked.detach().cpu().numpy()
+                    abs_x = np.abs(x_scaled)
+                    pct_gt_2 = (abs_x > 2).mean() * 100
+                    pct_gt_3 = (abs_x > 3).mean() * 100
+                    pct_gt_4 = (abs_x > 4).mean() * 100
+                    print(f">% |x| > 2 : {pct_gt_2:.2f}%")
+                    print(f">% |x| > 3 : {pct_gt_3:.2f}%")
+                    print(f">% |x| > 4 : {pct_gt_4:.2f}%")
+                    print("min:", float(x_scaled.min()), "max:", float(x_scaled.max()))
+                    print("p1/p50/p99:", np.percentile(x_scaled, [1, 50, 99]))
+
+                    if debug_batch_stats_names is not None:
+                        names = list(debug_batch_stats_names)
+                        if len(names) == x_scaled.shape[-1]:
+                            col_min = x_scaled.min(axis=(0, 1))
+                            col_max = x_scaled.max(axis=(0, 1))
+                            worst_min_idx = int(col_min.argmin())
+                            worst_max_idx = int(col_max.argmax())
+                            print("worst_min_feature:", names[worst_min_idx], float(col_min[worst_min_idx]))
+                            print("worst_max_feature:", names[worst_max_idx], float(col_max[worst_max_idx]))
+                        else:
+                            print(
+                                f"debug_batch_stats_names len ({len(names)}) "
+                                f"!= n_features ({x_scaled.shape[-1]}), skipping per-feature stats."
+                            )
+                    printed_batch_stats = True
 
                 optimizer.zero_grad(set_to_none=True)
                 (
@@ -819,10 +916,12 @@ class TSDiffusion(ODEJumpEncoder):
                         vae_tmax_logvar_obs,
                         kl_scale=self._kl_scale(ep, kl_start, kl_end, kl_warmup_epochs),
                     )
+                    if aux_spline_reg > 0 and hasattr(self, "aux_spline_penalty"):
+                        loss = loss + aux_spline_reg * self.aux_spline_penalty()
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=grad_clip_max_norm)
                 prev_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
@@ -830,6 +929,7 @@ class TSDiffusion(ODEJumpEncoder):
                 stepped = (new_scale >= prev_scale)
                 if stepped:
                     did_step_once = True
+                if scheduler is not None and lr_scheduler != "plateau":
                     scheduler.step()     # agora é seguro (optimizer.step() ocorreu neste batch)
                 for i, item in enumerate([L1, L2, L3, L4, L5, L6]):
                     total_train[i][0] += item[0]; total_train[i][1] += item[1]
@@ -842,11 +942,15 @@ class TSDiffusion(ODEJumpEncoder):
             train_L6 = total_train[5][0] / max(total_train[5][1], 1.0)
             vae_logvar_mean = (vae_logvar_sum / max(vae_logvar_count, 1)) if vae_logvar_count > 0 else None
 
+            val_micro_for_sched = None
             if validate and val_loader is not None:
                 val_metrics = self.test_model(val_loader, y_seq=y_win[val_idx], 
                                               all_groups=all_groups, only_gru=only_gru,
                                               reconstruction_test=reconstruction_test,
-                                              status_pred_window=delta_pred_window
+                                              eval_mask_seed=eval_mask_seed,
+                                              status_pred_window=delta_pred_window,
+                                              x_max=x_max,
+                                              x_min=x_min
                                               )
                 val_parts = [
                     f"Epoch {ep}/{epochs} | "
@@ -861,6 +965,7 @@ class TSDiffusion(ODEJumpEncoder):
                         f"Val macro:{val_metrics['macro_mse']:.6f} ± {val_metrics['macro_se']:.6f} | "
                         f"Val micro:{val_metrics['micro_mse']:.6f} ± {val_metrics['micro_se']:.6f} "
                     )
+                val_micro_for_sched = val_metrics.get("micro_mse")
                 if self.lam[1] > 0:
                     val_parts.append(
                         f"Val macro (noise):{val_metrics['macro_mse_n']:.6f} ± {val_metrics['macro_se_n']:.6f} | "
@@ -898,8 +1003,17 @@ class TSDiffusion(ODEJumpEncoder):
             test_metrics = self.test_model(
                 test_loader, y_seq=y_win[test_idx], 
                 all_groups=all_groups, only_gru=only_gru, reconstruction_test=reconstruction_test,
-                status_pred_window=delta_pred_window
+                eval_mask_seed=eval_mask_seed,
+                status_pred_window=delta_pred_window,
+                x_max=x_max,
+                x_min=x_min
                 )
+            if lr_scheduler == "plateau":
+                monitor_val = val_micro_for_sched if plateau_monitor == "val_micro" else None
+                if monitor_val is None:
+                    monitor_val = test_metrics.get("micro_mse")
+                if monitor_val is not None:
+                    scheduler.step(monitor_val)
             # incluir losses de treino L1..L6 no dicionário retornado por época
             epoch_time = time.time() - epoch_start
             epoch_metrics = dict(test_metrics)
@@ -911,6 +1025,7 @@ class TSDiffusion(ODEJumpEncoder):
                 "train_L5": float(train_L5),
                 "train_L6": float(train_L6),
                 "epoch_time": float(epoch_time),
+                "best_ckpt": best_ckpt,
                 "vae_logvar_obs_min": float(vae_logvar_min) if vae_logvar_count > 0 else None,
                 "vae_logvar_obs_mean": float(vae_logvar_mean) if vae_logvar_count > 0 else None,
                 "vae_logvar_obs_max": float(vae_logvar_max) if vae_logvar_count > 0 else None,
@@ -947,26 +1062,42 @@ class TSDiffusion(ODEJumpEncoder):
             if test_parts:
                 print("\n".join(test_parts))
 
-            if early_stopping:
-                score = (test_metrics["micro_mse"]*self.lam[0] + test_metrics["micro_mse_n"]*self.lam[1] + \
-                         test_metrics["micro_mse_s"]*self.lam[2] + test_metrics["micro_elbo_v"]*self.lam[4] + \
-                         (test_metrics.get("micro_elbo_vt", 0.0) * self.lam[5] if len(self.lam)>5 else 0.0) + \
-                2 * (test_metrics["micro_se"]*self.lam[0] + test_metrics["micro_se_n"]*self.lam[1] \
-                     + test_metrics["micro_se_s"]*self.lam[2]))
+            # critério: menor micro_mse na validação
+            score = None
+            if val_metrics is not None and "micro_mse" in val_metrics:
+                score = val_metrics["micro_mse"]
+            improved = False
+            if score is not None:
                 improved = score < best_score
+            if save_best_ckpt and improved:
+                    ckpt_name = f"seqKAN_ep{ep}_micro{score:.6f}.pt"
+                    self.save(ckpt_name)
+                    best_score = score
+                    best_epoch = ep
+                    best_ckpt = ckpt_name
+                    wait = patience
+
+            if early_stopping:
+                if score is None:
+                    raise ValueError("Early stopping com base em val_micro requer validate=True e val_metrics válidos.")
                 if improved:
-                    self.save("tsdiffusion.pt"); best_score = score
-                    best_epoch = ep; wait = patience
+                    # se save_best_ckpt=False, ainda atualiza melhor score
+                    best_score = score
+                    best_epoch = ep
+                    wait = patience
                 else:
                     wait -= 1
                     if wait <= 0:
-                        print(f"Early stopping at epoch {ep}/{epochs} (best test score: {best_score:.6f} @ epoch {best_epoch})")
+                        print(f"Early stopping at epoch {ep}/{epochs} (best val micro: {best_score:.6f} @ epoch {best_epoch})")
                         break
 
         # --- Resultado final no teste fixo
         final_metrics = self.test_model(
             test_loader, y_seq=y_win[test_idx], all_groups=all_groups, only_gru=only_gru,
-            reconstruction_test=reconstruction_test,status_pred_window=delta_pred_window
+            reconstruction_test=reconstruction_test, eval_mask_seed=eval_mask_seed,
+            status_pred_window=delta_pred_window,
+            x_max=x_max,
+            x_min=x_min
             )
         parts = ["TEST RESULTS | "]
         if self.lam[0] > 0:
@@ -987,34 +1118,34 @@ class TSDiffusion(ODEJumpEncoder):
                          f"micro (VAE tmax): {final_metrics['micro_mse_vt']:.6f} ± {final_metrics['micro_se_vt']:.6f} | "
                          f"ELBO:{final_metrics['micro_elbo_vt']:.6f} NLL:{final_metrics['micro_nll_vt']:.6f} cov90:{final_metrics['micro_cov_vt']:.3f} width90:{final_metrics['micro_width_vt']:.6f} ")
         print("".join(parts))
-        pg = test_metrics["per_group_mse"]
-        pg_sew = test_metrics["per_group_se_w"]
-        pg_cnt = test_metrics["per_group_counts"]
+        pg = final_metrics["per_group_mse"]
+        pg_sew = final_metrics["per_group_se_w"]
+        pg_cnt = final_metrics["per_group_counts"]
         print("          >> per_group (weighted SE):",
         {g: f"{pg[g]:.6f} ± {pg_sew[g]:.6f} (n={pg_cnt[g]})" for g in sorted(pg.keys())}
         )
-        pg_n = test_metrics["per_group_mse_n"]
-        pg_sew_n = test_metrics["per_group_se_w_n"]
+        pg_n = final_metrics["per_group_mse_n"]
+        pg_sew_n = final_metrics["per_group_se_w_n"]
         print("          >> per_group (weighted SE):",
         {g: f"{pg_n[g]:.6f} ± {pg_sew_n[g]:.6f} (n={pg_cnt[g]})" for g in sorted(pg.keys())}
         )
-        pg_s = test_metrics["per_group_mse_s"]
-        pg_sew_s = test_metrics["per_group_se_w_s"]
+        pg_s = final_metrics["per_group_mse_s"]
+        pg_sew_s = final_metrics["per_group_se_w_s"]
         print("          >> per_group (weighted SE):",
         {g: f"{pg_s[g]:.6f} ± {pg_sew_s[g]:.6f} (n={pg_cnt[g]})" for g in sorted(pg.keys())}
         )
-        pg_v = test_metrics["per_group_mse_v"]
-        pg_sew_v = test_metrics["per_group_se_w_v"]
+        pg_v = final_metrics["per_group_mse_v"]
+        pg_sew_v = final_metrics["per_group_se_w_v"]
         print("          >> per_group (weighted SE) VAE:",
         {g: f"{pg_v[g]:.6f} ± {pg_sew_v[g]:.6f} (n={pg_cnt[g]})" for g in sorted(pg.keys())}
         )
         if self.lam[4] > 0:
-            pg_elbo_v = test_metrics["per_group_elbo_v"]
+            pg_elbo_v = final_metrics["per_group_elbo_v"]
             print("          >> per_group ELBO VAE:",
             {g: f"{pg_elbo_v[g]:.6f}" for g in sorted(pg_elbo_v.keys())}
             )
         if len(self.lam) > 5 and self.lam[5] > 0:
-            pg_elbo_vt = test_metrics["per_group_elbo_vt"]
+            pg_elbo_vt = final_metrics["per_group_elbo_vt"]
             print("          >> per_group ELBO VAE tmax:",
             {g: f"{pg_elbo_vt[g]:.6f}" for g in sorted(pg_elbo_vt.keys())}
             )
@@ -1045,16 +1176,33 @@ class TSDiffusion(ODEJumpEncoder):
             all_groups=None, 
             only_gru=False,
             reconstruction_test: bool = True,
-            status_pred_window: int = 600
+            eval_mask_seed: int | None = None,
+            status_pred_window: int = 600,
+            x_max: float | None = None,
+            x_min: float | None = None
             ):
         if reconstruction_test:
+            if eval_mask_seed is not None:
+                return self._test_model(
+                    loader,
+                    y_seq,
+                    all_groups,
+                    only_gru,
+                    reconstruction_test,
+                    status_pred_window,
+                    eval_mask_seed=eval_mask_seed,
+                    x_max=x_max,
+                    x_min=x_min
+                )
             res = [self._test_model(
                 loader, 
                 y_seq, 
                 all_groups, 
                 only_gru,
                 reconstruction_test,
-                status_pred_window          
+                status_pred_window,
+                x_max=x_max,
+                x_min=x_min
             ) for i in range(13)]
             res_index = [
                 (res[i]["micro_mse"]*self.lam[0] + res[i]["micro_mse_n"]*self.lam[1] + \
@@ -1076,7 +1224,9 @@ class TSDiffusion(ODEJumpEncoder):
                 all_groups, 
                 only_gru,
                 reconstruction_test,
-                status_pred_window    
+                status_pred_window,
+                x_max=x_max,
+                x_min=x_min
             )           
 
 
@@ -1087,7 +1237,10 @@ class TSDiffusion(ODEJumpEncoder):
             all_groups=None, 
             only_gru=False,
             reconstruction_test: bool = True,
-            status_pred_window: int = 600
+            status_pred_window: int = 600,
+            eval_mask_seed: int | None = None,
+            x_max: float | None = None,
+            x_min: float | None = None
             ):
         """
         Avalia reconstrução por janela e retorna:
@@ -1160,6 +1313,10 @@ class TSDiffusion(ODEJumpEncoder):
         T_ELBO_VT_NUM, T_ELBO_VT_DEN = 0.0, 0.0
 
 
+        gen = None
+        if reconstruction_test and eval_mask_seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(eval_mask_seed)
         with torch.no_grad():
             for batch in loader:
                 z90 = 1.6448536269514722  # quantil ~90% para intervalo simétrico
@@ -1177,6 +1334,10 @@ class TSDiffusion(ODEJumpEncoder):
                 if self.status_dim>0:
                     p = batch[-1]
                 x, ts_batch, m, cc = x.to(device), ts_batch.to(device), m.to(device), cc.to(device)
+                if x_min is not None:
+                    x = torch.maximum(x, x.new_tensor(x_min))
+                if x_max is not None:
+                    x = torch.minimum(x, x.new_tensor(x_max))
                 if s is not None: s = s.to(device)
                 if p is not None: 
                     p = p.to(device)
@@ -1189,7 +1350,7 @@ class TSDiffusion(ODEJumpEncoder):
                     raise ValueError(f"test_model: desalinhado (batch={B}, labels={len(yb)} a partir de pos={pos}).")
                 pos += B
                 if reconstruction_test:
-                    m_train = self._make_random_mask(x,ts_batch,m,device)
+                    m_train = self._make_random_mask(x, ts_batch, m, device, generator=gen)
                     mask_ts = m_train.any(dim=2, keepdim=True).float()
                 else:
                     m_train = m.clone(); m_train[:, -1, :] = 0.0; mask_ts = m_train.any(dim=2, keepdim=True).float()
