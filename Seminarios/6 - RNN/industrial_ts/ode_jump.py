@@ -166,6 +166,9 @@ class ODEJump(nn.Module):
         self.val_loss = float('inf')
         self.model_dim = hidden_dim
         self.in_channels = in_channels
+        # clamp bounds (set by train_cognite)
+        self.x_min = None
+        self.x_max = None
         self.encoder = nn.Sequential(
             nn.Linear(in_channels*2, hidden_dim * 4),
             nn.ReLU(),
@@ -207,6 +210,9 @@ class ODEJump(nn.Module):
         """
         # Embedding de entrada
         if not already_latent:
+            x = self._clip_x_tensor(x)
+            if x_denoised is not None:
+                x_denoised = self._clip_x_tensor(x_denoised)
             if x_denoised is not None:
                 # aplique gate (treino=True quando model.training)
                 x_fused, _ = self.denoise_gate(x, x_denoised, mask, train_mode=self.training)
@@ -223,7 +229,19 @@ class ODEJump(nn.Module):
             raise ValueError("timestamps são obrigatórios para Jump‑ODE Encoder")
         h = self.odejump(h, timestamps)   # (B,T,model_dim)
         state = h
-        return state,self.decoder(state) if return_x_hat else None
+        x_hat = self.decoder(state) if return_x_hat else None
+        if x_hat is not None:
+            x_hat = self._clip_x_tensor(x_hat)
+        return x, state, x_hat
+
+    def _clip_x_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        if x is None:
+            return x
+        if self.x_min is not None:
+            x = torch.maximum(x, x.new_tensor(self.x_min))
+        if self.x_max is not None:
+            x = torch.minimum(x, x.new_tensor(self.x_max))
+        return x
 
     @staticmethod
     def _make_weighted_sampler_from_classes(y_classes: np.ndarray):
@@ -327,6 +345,8 @@ class ODEJump(nn.Module):
         mask: torch.Tensor,
         mask_train: torch.Tensor
     ):
+        x = self._clip_x_tensor(x)
+        x_hat = self._clip_x_tensor(x_hat)
         #L1torch.sqrt((err**2) + 1e-6)
         mask_err = mask * (1 - mask_train) # erro ao longo dos C canais observados 
         sse = (((x - x_hat)**2 * mask_err)+1e-6).sum(dim=-1) # (B,T) 
@@ -378,6 +398,9 @@ class ODEJump(nn.Module):
         import math
         device = next(self.parameters()).device
         self.eval()
+        # persist clamp bounds for forward/inference
+        self.x_min = x_min
+        self.x_max = x_max
 
         y_seq = np.asarray(y_seq, dtype=int)
         pos = 0
@@ -430,8 +453,10 @@ class ODEJump(nn.Module):
                 x_masked = x * m_train
                 x_denoised_masked = x_denoised * m_train if x_denoised is not None else None
                 x_masked = self.test_model_preforward(x_masked, timestamps=ts_batch, static_feats=s, return_x_hat=True, mask=m_train)
-                state, x_hat = self.forward(x_masked, timestamps=ts_batch, static_feats=s, return_x_hat=True, mask=m_train, x_denoised=x_denoised_masked)
+                x, state, x_hat = self.forward(x_masked, timestamps=ts_batch, static_feats=s, return_x_hat=True, mask=m_train, x_denoised=x_denoised_masked)
 
+                x = self._clip_x_tensor(x)
+                x_hat = self._clip_x_tensor(x_hat)
                 mask_err = m * (1.0 - m_train)
                 sse_bt  = ((x - x_hat)**2 * mask_err * cc).sum(dim=(1, 2))               # (B,)
                 nobs_bt = (mask_err * cc).sum(dim=(1, 2)).clamp(min=1.0)                   # (B,)
@@ -677,16 +702,14 @@ class ODEJump(nn.Module):
         df_denoised: pd.DataFrame | None = None,
         optimizer = None,
         x_max: float | None = None,
-        x_min: float | None = None
+        x_min: float | None = None,
+        debug_batch_stats: bool = False,
+        debug_batch_stats_names: list | None = None
     ):
-        def _clip_batch_x(x: torch.Tensor) -> torch.Tensor:
-            if x_min is not None:
-                x = torch.maximum(x, x.new_tensor(x_min))
-            if x_max is not None:
-                x = torch.minimum(x, x.new_tensor(x_max))
-            return x
-
         device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # persist clamp bounds for forward/inference
+        self.x_min = x_min
+        self.x_max = x_max
         df_sorted = df if timestamp_col == "index" else df.sort_values(timestamp_col).reset_index(drop=True)
 
         # Dataset (sem y) e rótulos de grupo por janela (para split/oversampling/relato)
@@ -746,6 +769,37 @@ class ODEJump(nn.Module):
         if validate and len(val_idx): print("GRUPOS (valid):", _count(y_win[val_idx]))
         print("GRUPOS (test): ", _count(y_win[test_idx]))
 
+        if debug_batch_stats:
+            names = debug_batch_stats_names if debug_batch_stats_names is not None else feature_cols
+
+            def _print_stats(x_batch: torch.Tensor):
+                x_cpu = x_batch.detach().float().cpu()
+                x_flat = x_cpu.reshape(-1, x_cpu.shape[-1])
+                pct2 = float((x_flat.abs() > 2).float().mean().item() * 100.0)
+                pct3 = float((x_flat.abs() > 3).float().mean().item() * 100.0)
+                pct4 = float((x_flat.abs() > 4).float().mean().item() * 100.0)
+                x_min_val = float(x_flat.min().item())
+                x_max_val = float(x_flat.max().item())
+                p1 = float(torch.quantile(x_flat, 0.01).item())
+                p50 = float(torch.quantile(x_flat, 0.50).item())
+                p99 = float(torch.quantile(x_flat, 0.99).item())
+                per_feat_min = x_flat.min(dim=0).values
+                per_feat_max = x_flat.max(dim=0).values
+                min_feat_idx = int(torch.argmin(per_feat_min).item())
+                max_feat_idx = int(torch.argmax(per_feat_max).item())
+                worst_min_feature = names[min_feat_idx] if min_feat_idx < len(names) else str(min_feat_idx)
+                worst_max_feature = names[max_feat_idx] if max_feat_idx < len(names) else str(max_feat_idx)
+                print(f">% |x| > 2 : {pct2:.2f}%")
+                print(f">% |x| > 3 : {pct3:.2f}%")
+                print(f">% |x| > 4 : {pct4:.2f}%")
+                print(f"min: {x_min_val:.1f} max: {x_max_val:.1f}")
+                print(f"p1/p50/p99: [{p1:.6f} {p50:.6f} {p99:.6f}]")
+                print(f"worst_min_feature: {worst_min_feature} {per_feat_min[min_feat_idx].item():.1f}")
+                print(f"worst_max_feature: {worst_max_feature} {per_feat_max[max_feat_idx].item():.1f}")
+        else:
+            def _print_stats(x_batch: torch.Tensor | None = None):
+                return
+
         # --- Treino + ES sempre no TESTE
         if optimizer is None:
             optimizer = torch.optim.AdamW(self.parameters(), lr=lr, betas=(0.9, 0.98), weight_decay=1e-4)
@@ -768,6 +822,7 @@ class ODEJump(nn.Module):
 
         for ep in range(1, epochs + 1):
             self.train()
+            printed_stats = False
             total_train = [[0.0, 0.0] for _ in range(2)]  # L1, L4
             scaler = torch.amp.GradScaler()
             for batch in train_loader:
@@ -790,13 +845,15 @@ class ODEJump(nn.Module):
                     elif self.cost_columns is not None:
                         cc = batch[3]                    
                 x, ts_batch, m, cc = x.to(device), ts_batch.to(device), m.to(device), cc.to(device)
-                x = _clip_batch_x(x)
+                if debug_batch_stats and not printed_stats:
+                    _print_stats(x)
+                    printed_stats = True
                 if s is not None: s = s.to(device)
                 if x_denoised is not None: x_denoised = x_denoised.to(device)
                 m_train = m.clone(); m_train[:, -1, :] = 0.0
                 x_masked = x * m_train
                 x_denoised_masked = x_denoised * m_train if x_denoised is not None else None
-                state, x_hat = self.forward(x_masked, timestamps=ts_batch, static_feats=s, return_x_hat=True, mask=m_train,x_denoised=x_denoised_masked)
+                x, state, x_hat = self.forward(x_masked, timestamps=ts_batch, static_feats=s, return_x_hat=True, mask=m_train,x_denoised=x_denoised_masked)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast(device_type='cuda'):
                     loss, L1, L4 = self._compute_loss(x * cc, x_hat * cc, state, m, m_train)
@@ -817,17 +874,22 @@ class ODEJump(nn.Module):
                 val_metrics = self.test_model(val_loader, y_seq=y_win[val_idx], all_groups=all_groups, 
                                               static=static_features_cols, denoised=df_denoised is not None,
                                               x_max=x_max, x_min=x_min)
+                # inclui loss de treino no retorno (compatível com resumo do notebook)
+                val_metrics["train_L1"] = float(train_L1)
+                val_metrics["train_L4"] = float(train_L4)
                 yield val_metrics
                 print(
                     f"Epoch {ep}/{epochs} | "
-                    f"Train(sampled) L1:{train_L1:.6f} L4:{train_L4:.6f} | "
+                    f"Train(sampled) L1:{train_L1:.6f} L2:0.000000 L3:0.000000  "
+                    f"L5:0.000000 L6:0.000000 | "
                     f"Val macro:{val_metrics['macro_mse']:.6f} ± {val_metrics['macro_se']:.6f} | "
                     f"Val micro:{val_metrics['micro_mse']:.6f} ± {val_metrics['micro_se']:.6f}"
                 )
             else:
                 print(
                     f"Epoch {ep}/{epochs} | "
-                    f"Train(sampled) L1:{train_L1:.6f} L4:{train_L4:.6f} | "
+                    f"Train(sampled) L1:{train_L1:.6f} L2:0.000000 L3:0.000000  "
+                    f"L5:0.000000 L6:0.000000 | "
                 )
 
             # teste fixo e ES
@@ -912,10 +974,10 @@ class ODEJump(nn.Module):
             m_train = m.copy()
             m_train[:, -1, :] = 0.0
             x_masked = x * m_train
-            state, x_hat  = self.forward(
+            x, state, x_hat  = self.forward(
                 x_masked, timestamps=ts_batch, static_feats=s, 
                 return_x_hat=True, mask=m_train
-                )
+            )
             # ---------- cabeças ----------
             loss,L1,L4= self._compute_loss(
                 x, x_hat, state, m, m_train

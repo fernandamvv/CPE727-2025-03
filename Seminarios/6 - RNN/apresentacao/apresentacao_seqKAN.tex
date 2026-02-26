@@ -241,7 +241,43 @@ Grid 40 Clamp-6/6 RAdam
 
 \end{frame}
 
+\begin{table}[H]
+\centering
+\caption{Comparação dos modelos considerando resultado final de teste}
+\label{tab:final_test_results}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{l r c c c c}
+\toprule
+Modelo
+& L1 (Train Final)
+& Test Micro MSE ($\mu \pm \sigma$)
+& Test Macro MSE ($\mu \pm \sigma$)
+& Grupo 0 ($\mu \pm \sigma$)
+& Grupo 1 ($\mu \pm \sigma$) \\
+\midrule
+TSDF\_GRU
+& 0.235949
+& $0.177969 \pm 0.003852$
+& $0.222494 \pm 0.055592$
+& ---
+& --- \\
 
+TS\_seqKANSeq
+& 0.009126
+& $\mathbf{0.005200 \pm 0.002580}$
+& $\mathbf{0.002945 \pm 0.002802}$
+& ---
+& --- \\
+
+TSDF\_seqKANseq
+& 0.281832
+& $0.214387 \pm 0.004517$
+& $0.279979 \pm 0.081897$
+& $0.198082 \pm 0.004246$
+& $0.361876 \pm 0.023375$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
 
 \begin{frame}{Resultados por Grupos}
 \begin{table}[H]

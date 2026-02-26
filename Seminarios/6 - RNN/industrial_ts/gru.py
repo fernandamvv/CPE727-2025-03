@@ -148,6 +148,9 @@ class TS_GRU(ODEJump):
         """
         # Embedding de entrada
         if not already_latent:
+            x = self._clip_x_tensor(x)
+            if x_denoised is not None:
+                x_denoised = self._clip_x_tensor(x_denoised)
             if x_denoised is not None:
                 # aplique gate (treino=True quando model.training)
                 x_fused, _ = self.denoise_gate(x, x_denoised, mask, train_mode=self.training)
@@ -164,7 +167,10 @@ class TS_GRU(ODEJump):
             h = h + se
         h = self.gru(h)
         state = h
-        return state,self.decoder(state) if return_x_hat else None    
+        x_hat = self.decoder(state) if return_x_hat else None
+        if x_hat is not None:
+            x_hat = self._clip_x_tensor(x_hat)
+        return x, state, x_hat
         
 class GRUEncoder(nn.Module):
     """

@@ -319,7 +319,8 @@ class ODEJumpEncoder(ODEJump):
         #h = h + tm_e
         h = self.encoder_ode(h, timestamps)
         state = h
-        return state,self.decoder(state) if return_x_hat else None
+        x_hat = self.decoder(state) if return_x_hat else None
+        return x, state, x_hat
                 
     def train_cognite(self,*args,**kwargs):
         # exemplo para ODEJumpEncoder: ajuste nomes conforme sua classe
