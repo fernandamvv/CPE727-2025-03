@@ -231,5 +231,5 @@ tmp/
 data/
 
 *.sif
-
+seqKAN_results/ignore
 results/

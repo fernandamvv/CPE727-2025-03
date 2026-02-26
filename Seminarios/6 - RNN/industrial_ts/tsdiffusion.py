@@ -9,6 +9,7 @@ import pandas as pd
 import time
 from torch.utils.data import DataLoader, Subset, TensorDataset
 from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler
 
 max_drop = 0.3
 LOGVAR_MIN = -5.0
@@ -87,11 +88,11 @@ class TSDiffusion(ODEJumpEncoder):
         static_dim: int = 0,
         status_dim: int = 0,
         lam: list[float,float,float,float,float,float] = [0.9, 0.0, 0.0, 0.1, 0.0, 0.0],
-        n_heads: int = 4,
+        n_heads: int = 1,
         n_layers: int = 4,
         num_steps: int = 1000,
         cost_columns: list = None,
-        n_heads_g: int = 4,
+        n_heads_g: int = 1,
         n_layers_g: int = 4,
         log_likelihood: bool = True,
         sigma_temp: float = 0.7
@@ -306,6 +307,8 @@ class TSDiffusion(ODEJumpEncoder):
         mask=kwargs['mask']
         x0=kwargs['x0']
         return_x_hat=kwargs.get('return_x_hat',True)
+        x_min = kwargs.get('x_min', None)
+        x_max = kwargs.get('x_max', None)
         t=torch.full((state.size(0),), 0, device=device, dtype=torch.long)
         mask_ts = mask.any(dim=2, keepdim=True).float()
         (
@@ -331,8 +334,17 @@ class TSDiffusion(ODEJumpEncoder):
         # use a saída do VAE como estimativa.
         if x_hat_step is None and self.lam[4] > 0 and vae_x is not None:
             x_hat_step = vae_x
+        if x_hat_step is not None and (x_min is not None or x_max is not None):
+            if x_min is not None:
+                x_hat_step = torch.maximum(x_hat_step, x_hat_step.new_tensor(x_min))
+            if x_max is not None:
+                x_hat_step = torch.minimum(x_hat_step, x_hat_step.new_tensor(x_max))
 
         x_clamped  = torch.where(mask.bool(), x0, x_hat_step)
+        if x_min is not None:
+            x_clamped = torch.maximum(x_clamped, x_clamped.new_tensor(x_min))
+        if x_max is not None:
+            x_clamped = torch.minimum(x_clamped, x_clamped.new_tensor(x_max))
         if return_x_hat:
             return x_clamped
         z = self.encoder(torch.cat([x_clamped, torch.ones_like(mask)], dim=-1))
@@ -340,7 +352,9 @@ class TSDiffusion(ODEJumpEncoder):
 
     def denoise(self, state, timestamps, static_feats, device, steps,
                 x0: torch.Tensor | None = None, mask: torch.Tensor | None = None,
-                enforce_data_consistency: bool = True):
+                enforce_data_consistency: bool = True,
+                x_min: float | None = None,
+                x_max: float | None = None):
         
         t=torch.full((state.size(0),), 0, device=device, dtype=torch.long)
         mask_ts = mask.any(dim=2, keepdim=True).float() 
@@ -366,8 +380,17 @@ class TSDiffusion(ODEJumpEncoder):
         # Se não há cabeça L1 mas há VAE, use vae_x como estimativa inicial
         if x_hat_step is None and self.lam[4] > 0 and vae_x is not None:
             x_hat_step = vae_x
+        if x_hat_step is not None and (x_min is not None or x_max is not None):
+            if x_min is not None:
+                x_hat_step = torch.maximum(x_hat_step, x_hat_step.new_tensor(x_min))
+            if x_max is not None:
+                x_hat_step = torch.minimum(x_hat_step, x_hat_step.new_tensor(x_max))
 
         x_clamped  = torch.where(mask.bool(), x0, x_hat_step)
+        if x_min is not None:
+            x_clamped = torch.maximum(x_clamped, x_clamped.new_tensor(x_min))
+        if x_max is not None:
+            x_clamped = torch.minimum(x_clamped, x_clamped.new_tensor(x_max))
         z = self.encoder(torch.cat([x_clamped, torch.ones_like(x_clamped)], dim=-1))
         for i in reversed(range(steps)):
             a, ab = self.alpha[i], self.alpha_bar[i]
@@ -387,7 +410,15 @@ class TSDiffusion(ODEJumpEncoder):
             if enforce_data_consistency and (x0 is not None) and (mask is not None):
                 with torch.no_grad():
                     x_hat_step = self.decoder(torch.cat([z,torch.zeros_like(z)], dim=-1))  # (B,T,C)
+                    if x_min is not None:
+                        x_hat_step = torch.maximum(x_hat_step, x_hat_step.new_tensor(x_min))
+                    if x_max is not None:
+                        x_hat_step = torch.minimum(x_hat_step, x_hat_step.new_tensor(x_max))
                     x_clamped  = torch.where(mask.bool(), x0, x_hat_step)
+                    if x_min is not None:
+                        x_clamped = torch.maximum(x_clamped, x_clamped.new_tensor(x_min))
+                    if x_max is not None:
+                        x_clamped = torch.minimum(x_clamped, x_clamped.new_tensor(x_max))
                     # re-encode para latente mantendo a máscara
                     z = self.encoder(torch.cat([x_clamped, mask], dim=-1))
 
@@ -617,37 +648,25 @@ class TSDiffusion(ODEJumpEncoder):
         seed_split: int = 42,
         lr_t: float = 1.5e-4,
         only_gru: bool = False,
-        reconstruction_test: bool = True,
-        eval_mask_seed: int | None = None,
-        debug_batch_stats: bool = False,
-        debug_batch_stats_names: list[str] | None = None,
-        debug_scaler: bool = False,
-        grad_clip_max_norm: float = 1.0,
+        reconstruction_test: bool = True,        grad_clip_max_norm: float = 1.0,
         optimizer_name: str = 'adamw',
         optimizer_params: dict = {'weight_decay': 1e-4},
         warmup_steps: int = 0,
         min_lr_factor: float = 0.1,
-        lr_scheduler: str = "plateau",
-        plateau_monitor: str = "val_micro",
-        plateau_factor: float = 0.5,
-        plateau_patience: int = 8,
-        plateau_min_lr: float = 1e-6,
-        spline_soft_freeze_epoch: int = 36,
-        spline_soft_freeze_factor: float = 0.02,
-        aux_lr_factor: float = 0.5,
-        aux_spline_reg: float = 0.0,
-        spline_param_keywords: tuple[str, ...] = ("kan_", "act_fun", "coef", "grid", "spline"),
         lambda1: float = 0.0,
         rebuild: bool = True,
         kl_start: float = 0.001,
         kl_end: float = 1.0,
-        kl_warmup_epochs: int = 50,
-        save_best_ckpt: bool = True,
-        train_fraction: float = 0.6,
+        kl_warmup_epochs: int = 50,        train_fraction: float = 0.6,
         weight_tmax: float = 1.0,
         x_max: float | None = None,
-        x_min: float | None = None
+        x_min: float | None = None,
+        debug_batch_stats: bool = False,
+        debug_batch_stats_names: list | None = None,
+        save_best_ckpt: bool = True,
+        **kwargs
     ):
+        _ = kwargs
         def _clip_batch_x(x: torch.Tensor) -> torch.Tensor:
             if x_min is not None:
                 x = torch.maximum(x, x.new_tensor(x_min))
@@ -658,38 +677,21 @@ class TSDiffusion(ODEJumpEncoder):
         delta_pred_window = np.float32(status_pred_window / TS_SPAN)
         # exemplo para ODEJumpEncoder: ajuste nomes conforme sua classe
         transformer_params = []
-        spline_params = []
-        aux_params = []
         base_params = []
         for n,p in self.named_parameters():
             if "transformer" in n or "encoder_ode" in n:  # bloco de atenção
                 transformer_params.append(p)
                 continue
-            if "aux" in n:
-                aux_params.append(p)
-                continue
-            if any(k in n for k in spline_param_keywords):
-                spline_params.append(p)
-            else:
-                base_params.append(p)
+            base_params.append(p)
         base_params = {'params': base_params}
-        spline_params = {'params': spline_params, 'name': 'spline'}
-        aux_params = {'params': aux_params, 'name': 'spline_aux'}
         transformer_params = {'params': transformer_params}
         base_params.update(optimizer_params)
-        spline_params.update(optimizer_params)
-        aux_params.update(optimizer_params)
         transformer_params.update(optimizer_params)
         base_params['lr'] = lr
-        spline_params['lr'] = lr
-        aux_params['lr'] = lr * aux_lr_factor
         transformer_params['lr'] = lr_t
 
-        param_groups = [base_params, spline_params, transformer_params]
-        if len(aux_params["params"]) > 0:
-            param_groups.insert(2, aux_params)
         optimizer = self.optimizers[optimizer_name](
-            param_groups,
+            [base_params, transformer_params],
             betas=(0.9, 0.98)
         )
 
@@ -731,14 +733,7 @@ class TSDiffusion(ODEJumpEncoder):
             train_idx, val_idx, test_idx = self._split_by_group_proportions(
                 y_win, validate=validate, train_frac=train_frac, val_frac=val_frac, test_frac=test_frac, seed=seed_split
             )
-        if debug_scaler:
-            x_all_scaled, data_scaler = self.scale_tensor(
-                ds.tensors[0][train_idx], ds.tensors[0], return_scaler=True
-            )
-            print("RobustScaler center_ (train):", data_scaler.center_)
-            print("RobustScaler scale_  (train):", data_scaler.scale_)
-        else:
-            x_all_scaled = self.scale_tensor(ds.tensors[0][train_idx], ds.tensors[0])
+        x_all_scaled = self.scale_tensor(ds.tensors[0][train_idx], ds.tensors[0])
         ds.tensors = (torch.tensor(x_all_scaled, dtype=torch.float32),) + ds.tensors[1:]
         # --- Oversampling APENAS no treino
         train_sampler = self._make_weighted_sampler_from_classes(y_win[train_idx]) if len(train_idx) else None
@@ -762,48 +757,63 @@ class TSDiffusion(ODEJumpEncoder):
         if validate and len(val_idx): print("GRUPOS (valid):", _count(y_win[val_idx]))
         print("GRUPOS (test): ", _count(y_win[test_idx]))
 
+        if debug_batch_stats:
+            names = debug_batch_stats_names if debug_batch_stats_names is not None else feature_cols
+
+            def _print_stats(x_batch: torch.Tensor):
+                # stats do batch (apos clip), para refletir clamp
+                x_cpu = x_batch.detach().float().cpu()
+                x_flat = x_cpu.reshape(-1, x_cpu.shape[-1])
+                pct2 = float((x_flat.abs() > 2).float().mean().item() * 100.0)
+                pct3 = float((x_flat.abs() > 3).float().mean().item() * 100.0)
+                pct4 = float((x_flat.abs() > 4).float().mean().item() * 100.0)
+                x_min_val = float(x_flat.min().item())
+                x_max_val = float(x_flat.max().item())
+                p1 = float(torch.quantile(x_flat, 0.01).item())
+                p50 = float(torch.quantile(x_flat, 0.50).item())
+                p99 = float(torch.quantile(x_flat, 0.99).item())
+                per_feat_min = x_flat.min(dim=0).values
+                per_feat_max = x_flat.max(dim=0).values
+                min_feat_idx = int(torch.argmin(per_feat_min).item())
+                max_feat_idx = int(torch.argmax(per_feat_max).item())
+                worst_min_feature = names[min_feat_idx] if min_feat_idx < len(names) else str(min_feat_idx)
+                worst_max_feature = names[max_feat_idx] if max_feat_idx < len(names) else str(max_feat_idx)
+                print(f">% |x| > 2 : {pct2:.2f}%")
+                print(f">% |x| > 3 : {pct3:.2f}%")
+                print(f">% |x| > 4 : {pct4:.2f}%")
+                print(f"min: {x_min_val:.1f} max: {x_max_val:.1f}")
+                print(f"p1/p50/p99: [{p1:.6f} {p50:.6f} {p99:.6f}]")
+                print(f"worst_min_feature: {worst_min_feature} {per_feat_min[min_feat_idx].item():.1f}")
+                print(f"worst_max_feature: {worst_max_feature} {per_feat_max[max_feat_idx].item():.1f}")
+        else:
+            def _print_stats(x_batch: torch.Tensor | None = None):
+                return
+
         # --- Treino + ES sempre no TESTE
         self.to(device)
         best_score = float("inf"); best_epoch = 0; wait = patience
         best_ckpt = None
         steps_per_epoch = max(len(train_loader), 1)
         total_steps     = max(epochs * steps_per_epoch, 1)
-        if lr_scheduler == "plateau":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=plateau_factor,
-                patience=plateau_patience,
-                min_lr=plateau_min_lr,
-            )
-        elif lr_scheduler == "none":
-            scheduler = None
-        else:
-            def lr_lambda(step):
-                if step < warmup_steps:
-                    return (step + 1) / max(warmup_steps, 1)  # linear warmup
-                # cosine decay até min_lr_factor
-                progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-                cosine = 0.5 * (1 + math.cos(math.pi * progress))
-                return min_lr_factor + (1 - min_lr_factor) * cosine
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / max(warmup_steps, 1)  # linear warmup
+            # cosine decay até min_lr_factor
+            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            cosine = 0.5 * (1 + math.cos(math.pi * progress))
+            return min_lr_factor + (1 - min_lr_factor) * cosine
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         for ep in range(1, epochs + 1):
-            if spline_soft_freeze_epoch is not None and ep == spline_soft_freeze_epoch:
-                for group in optimizer.param_groups:
-                    if group.get('name') == 'spline':
-                        group['lr'] *= spline_soft_freeze_factor
+            self.current_epoch = ep
             epoch_start = time.time()
             self.train()
+            printed_stats = False
             total_train = [[0.0, 0.0] for _ in range(6)]  # L1..L6
             vae_logvar_sum = 0.0
             vae_logvar_count = 0
             vae_logvar_min = None
             vae_logvar_max = None
             scaler = torch.amp.GradScaler()
-            printed_batch_stats = False
-            if debug_scaler and ep in (1, 2):
-                print(f"[Epoch {ep}] RobustScaler center_ (train):", data_scaler.center_)
-                print(f"[Epoch {ep}] RobustScaler scale_  (train):", data_scaler.scale_)
             for batch in train_loader:
                 s = None
                 p = None
@@ -820,6 +830,9 @@ class TSDiffusion(ODEJumpEncoder):
                     p = batch[-1]
                 x, ts_batch, m, cc = x.to(device), ts_batch.to(device), m.to(device), cc.to(device)
                 x = _clip_batch_x(x)
+                if debug_batch_stats and not printed_stats:
+                    _print_stats(x)
+                    printed_stats = True
                 if s is not None: s = s.to(device)
                 if p is not None: p = p.to(device)
 
@@ -830,33 +843,6 @@ class TSDiffusion(ODEJumpEncoder):
                     m_train[:,-1,:]=0
                 m_train_ts = m_train.any(dim=2, keepdim=True).float()
                 x_masked = x * m_train
-                if debug_batch_stats and not printed_batch_stats:
-                    x_scaled = x_masked.detach().cpu().numpy()
-                    abs_x = np.abs(x_scaled)
-                    pct_gt_2 = (abs_x > 2).mean() * 100
-                    pct_gt_3 = (abs_x > 3).mean() * 100
-                    pct_gt_4 = (abs_x > 4).mean() * 100
-                    print(f">% |x| > 2 : {pct_gt_2:.2f}%")
-                    print(f">% |x| > 3 : {pct_gt_3:.2f}%")
-                    print(f">% |x| > 4 : {pct_gt_4:.2f}%")
-                    print("min:", float(x_scaled.min()), "max:", float(x_scaled.max()))
-                    print("p1/p50/p99:", np.percentile(x_scaled, [1, 50, 99]))
-
-                    if debug_batch_stats_names is not None:
-                        names = list(debug_batch_stats_names)
-                        if len(names) == x_scaled.shape[-1]:
-                            col_min = x_scaled.min(axis=(0, 1))
-                            col_max = x_scaled.max(axis=(0, 1))
-                            worst_min_idx = int(col_min.argmin())
-                            worst_max_idx = int(col_max.argmax())
-                            print("worst_min_feature:", names[worst_min_idx], float(col_min[worst_min_idx]))
-                            print("worst_max_feature:", names[worst_max_idx], float(col_max[worst_max_idx]))
-                        else:
-                            print(
-                                f"debug_batch_stats_names len ({len(names)}) "
-                                f"!= n_features ({x_scaled.shape[-1]}), skipping per-feature stats."
-                            )
-                    printed_batch_stats = True
 
                 optimizer.zero_grad(set_to_none=True)
                 (
@@ -878,6 +864,10 @@ class TSDiffusion(ODEJumpEncoder):
                     x_masked, timestamps=ts_batch, 
                     static_feats=s, return_x_hat=True, mask=m_train, mask_ts=m_train_ts,test=False,
                     only_gru=only_gru)
+                if x_hat is not None:
+                    x_hat = _clip_batch_x(x_hat)
+                if vae_x is not None:
+                    vae_x = _clip_batch_x(vae_x)
                 if vae_logvar_obs is not None:
                     v = vae_logvar_obs.detach()
                     v_min = float(v.min().item())
@@ -916,8 +906,6 @@ class TSDiffusion(ODEJumpEncoder):
                         vae_tmax_logvar_obs,
                         kl_scale=self._kl_scale(ep, kl_start, kl_end, kl_warmup_epochs),
                     )
-                    if aux_spline_reg > 0 and hasattr(self, "aux_spline_penalty"):
-                        loss = loss + aux_spline_reg * self.aux_spline_penalty()
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -929,8 +917,7 @@ class TSDiffusion(ODEJumpEncoder):
                 stepped = (new_scale >= prev_scale)
                 if stepped:
                     did_step_once = True
-                if scheduler is not None and lr_scheduler != "plateau":
-                    scheduler.step()     # agora é seguro (optimizer.step() ocorreu neste batch)
+                scheduler.step()     # agora é seguro (optimizer.step() ocorreu neste batch)
                 for i, item in enumerate([L1, L2, L3, L4, L5, L6]):
                     total_train[i][0] += item[0]; total_train[i][1] += item[1]
 
@@ -942,13 +929,11 @@ class TSDiffusion(ODEJumpEncoder):
             train_L6 = total_train[5][0] / max(total_train[5][1], 1.0)
             vae_logvar_mean = (vae_logvar_sum / max(vae_logvar_count, 1)) if vae_logvar_count > 0 else None
 
-            val_micro_for_sched = None
+            val_metrics = None
             if validate and val_loader is not None:
                 val_metrics = self.test_model(val_loader, y_seq=y_win[val_idx], 
                                               all_groups=all_groups, only_gru=only_gru,
-                                              reconstruction_test=reconstruction_test,
-                                              eval_mask_seed=eval_mask_seed,
-                                              status_pred_window=delta_pred_window,
+                                              reconstruction_test=reconstruction_test,                                              status_pred_window=delta_pred_window,
                                               x_max=x_max,
                                               x_min=x_min
                                               )
@@ -965,7 +950,6 @@ class TSDiffusion(ODEJumpEncoder):
                         f"Val macro:{val_metrics['macro_mse']:.6f} ± {val_metrics['macro_se']:.6f} | "
                         f"Val micro:{val_metrics['micro_mse']:.6f} ± {val_metrics['micro_se']:.6f} "
                     )
-                val_micro_for_sched = val_metrics.get("micro_mse")
                 if self.lam[1] > 0:
                     val_parts.append(
                         f"Val macro (noise):{val_metrics['macro_mse_n']:.6f} ± {val_metrics['macro_se_n']:.6f} | "
@@ -1002,34 +986,43 @@ class TSDiffusion(ODEJumpEncoder):
             # teste fixo e ES
             test_metrics = self.test_model(
                 test_loader, y_seq=y_win[test_idx], 
-                all_groups=all_groups, only_gru=only_gru, reconstruction_test=reconstruction_test,
-                eval_mask_seed=eval_mask_seed,
-                status_pred_window=delta_pred_window,
+                all_groups=all_groups, only_gru=only_gru, reconstruction_test=reconstruction_test,                status_pred_window=delta_pred_window,
                 x_max=x_max,
                 x_min=x_min
                 )
-            if lr_scheduler == "plateau":
-                monitor_val = val_micro_for_sched if plateau_monitor == "val_micro" else None
-                if monitor_val is None:
-                    monitor_val = test_metrics.get("micro_mse")
-                if monitor_val is not None:
-                    scheduler.step(monitor_val)
             # incluir losses de treino L1..L6 no dicionário retornado por época
             epoch_time = time.time() - epoch_start
             epoch_metrics = dict(test_metrics)
             epoch_metrics.update({
+                "epoch": int(ep),
                 "train_L1": float(train_L1),
                 "train_L2": float(train_L2),
                 "train_L3": float(train_L3),
                 "train_L4": float(train_L4),
                 "train_L5": float(train_L5),
                 "train_L6": float(train_L6),
+                "val_micro": float(val_metrics["micro_mse"]) if val_metrics is not None else None,
+                "val_micro_se": float(val_metrics["micro_se"]) if val_metrics is not None else None,
+                "val_macro": float(val_metrics["macro_mse"]) if val_metrics is not None else None,
+                "val_macro_se": float(val_metrics["macro_se"]) if val_metrics is not None else None,
                 "epoch_time": float(epoch_time),
                 "best_ckpt": best_ckpt,
                 "vae_logvar_obs_min": float(vae_logvar_min) if vae_logvar_count > 0 else None,
                 "vae_logvar_obs_mean": float(vae_logvar_mean) if vae_logvar_count > 0 else None,
                 "vae_logvar_obs_max": float(vae_logvar_max) if vae_logvar_count > 0 else None,
             })
+            # optional top-k sparsity stats (from SeqKAN)
+            try:
+                ratios = {}
+                if hasattr(self, "encoder_ode_x") and hasattr(self.encoder_ode_x, "seqkan"):
+                    ratios.update(getattr(self.encoder_ode_x.seqkan, "last_topk_ratio", {}) or {})
+                if hasattr(self, "encoder_ode_tmax") and hasattr(self.encoder_ode_tmax, "seqkan"):
+                    for k, v in (getattr(self.encoder_ode_tmax.seqkan, "last_topk_ratio", {}) or {}).items():
+                        ratios[f"tmax_{k}"] = v
+                if ratios:
+                    epoch_metrics["topk_ratio"] = dict(ratios)
+            except Exception:
+                pass
             yield epoch_metrics
             test_parts = []
             if self.lam[0] > 0:
@@ -1092,10 +1085,18 @@ class TSDiffusion(ODEJumpEncoder):
                         break
 
         # --- Resultado final no teste fixo
+        # Se houve checkpoint salvo por melhor val_micro, recarrega antes do teste final
+        if save_best_ckpt and best_ckpt is not None:
+            try:
+                state = torch.load(best_ckpt, map_location=device)
+                self.load_state_dict(state)
+                print(f"Loaded best checkpoint for final test: {best_ckpt}")
+            except Exception as e:
+                print(f"Warning: failed to load best checkpoint '{best_ckpt}' before final test: {e}")
+
         final_metrics = self.test_model(
             test_loader, y_seq=y_win[test_idx], all_groups=all_groups, only_gru=only_gru,
-            reconstruction_test=reconstruction_test, eval_mask_seed=eval_mask_seed,
-            status_pred_window=delta_pred_window,
+            reconstruction_test=reconstruction_test,            status_pred_window=delta_pred_window,
             x_max=x_max,
             x_min=x_min
             )
@@ -1175,9 +1176,7 @@ class TSDiffusion(ODEJumpEncoder):
             y_seq, 
             all_groups=None, 
             only_gru=False,
-            reconstruction_test: bool = True,
-            eval_mask_seed: int | None = None,
-            status_pred_window: int = 600,
+            reconstruction_test: bool = True,            status_pred_window: int = 600,
             x_max: float | None = None,
             x_min: float | None = None
             ):
@@ -1189,9 +1188,7 @@ class TSDiffusion(ODEJumpEncoder):
                     all_groups,
                     only_gru,
                     reconstruction_test,
-                    status_pred_window,
-                    eval_mask_seed=eval_mask_seed,
-                    x_max=x_max,
+                    status_pred_window,                    x_max=x_max,
                     x_min=x_min
                 )
             res = [self._test_model(
@@ -1237,11 +1234,15 @@ class TSDiffusion(ODEJumpEncoder):
             all_groups=None, 
             only_gru=False,
             reconstruction_test: bool = True,
-            status_pred_window: int = 600,
-            eval_mask_seed: int | None = None,
-            x_max: float | None = None,
+            status_pred_window: int = 600,            x_max: float | None = None,
             x_min: float | None = None
             ):
+        def _clip_batch_x(x: torch.Tensor) -> torch.Tensor:
+            if x_min is not None:
+                x = torch.maximum(x, x.new_tensor(x_min))
+            if x_max is not None:
+                x = torch.minimum(x, x.new_tensor(x_max))
+            return x
         """
         Avalia reconstrução por janela e retorna:
         - micro_mse, micro_se            (ponderado por nobs, todas as janelas)
@@ -1358,6 +1359,10 @@ class TSDiffusion(ODEJumpEncoder):
                 _, _, _, x_hat, tmax_hat, noise, noise_hat, vae_x, vae_mu, vae_logvar, vae_tmax, vae_tmax_mu, vae_tmax_logvar, vae_logvar_obs, vae_tmax_logvar_obs = self.forward(
                     x_masked, timestamps=ts_batch, static_feats=s, 
                     return_x_hat=True, mask=m_train, mask_ts=mask_ts, test=False,only_gru=only_gru)
+                if x_hat is not None:
+                    x_hat = _clip_batch_x(x_hat)
+                if vae_x is not None:
+                    vae_x = _clip_batch_x(vae_x)
                 
                 offset_state_pred = (p - ts_batch.unsqueeze(-1)).clamp(min=0,max=status_pred_window) / status_pred_window
                 if tmax_hat is None:
@@ -2007,6 +2012,8 @@ class TSDiffusion(ODEJumpEncoder):
         steps: int | None = None,
         replace_only_missing: bool = True,
         device: torch.device | None = None,
+        x_min: float | None = None,
+        x_max: float | None = None,
     ) -> pd.DataFrame:
         """
         Retorna um novo DataFrame com as colunas feature_cols denoised.
@@ -2062,6 +2069,8 @@ class TSDiffusion(ODEJumpEncoder):
                     mask=mask_seqs,
                     x0=seqs,
                     return_x_hat=True,
+                    x_min=x_min,
+                    x_max=x_max,
                 )
                 x_r = x_r.detach().cpu().numpy()
                 x_hat = None
@@ -2075,7 +2084,9 @@ class TSDiffusion(ODEJumpEncoder):
                     steps=n_steps,
                     x0=seqs,                     # <- importante
                     mask=mask_seqs,              # <- importante
-                    enforce_data_consistency=False
+                    enforce_data_consistency=False,
+                    x_min=x_min,
+                    x_max=x_max,
                 )
                 x_hat = self.decoder(z).detach().cpu().numpy()
                 x_r = x_r.detach().cpu().numpy()

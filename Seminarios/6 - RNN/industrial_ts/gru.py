@@ -156,6 +156,8 @@ class TS_GRU(ODEJump):
                 h_in = torch.cat([x, mask], dim=-1)
 
             h = self.encoder(h_in)  # (B,T,hidden_dim)
+        if timestamps is None:
+            raise ValueError("timestamps são obrigatórios para Jump‑ODE Encoder")
         # Static features
         if static_feats is not None and self.static_dim > 0:
             se = self.static_proj(static_feats).unsqueeze(1)  # (b,1,model_dim)
@@ -211,7 +213,7 @@ class GRUEncoder(nn.Module):
             )
  
 
-    def forward(self, x, ts=None, only_gru=False):  # noqa: ARG002
+    def forward(self, x, ts, only_gru=False):
         if self.training and self.variational_dropout > 0:
             B, _, C = x.shape
             mask = x.new_ones(B, C)

@@ -4,7 +4,6 @@ from pathlib import Path
 import sys
 import warnings
 import time
-import math
 
 import torch
 import torch.nn as nn
@@ -15,7 +14,7 @@ from sklearn.preprocessing import RobustScaler
 import pandas as pd
 
 from .ode_jump import ODEJump, TS_SPAN
-from .tsdiffusion import TSDiffusion, cosine_beta_schedule
+from .tsdiffusion import TSDiffusion
 
 _SEQKAN_ARTIGO_PATH = Path("/home/ferna/seqKAN_artigo")
 
@@ -53,6 +52,121 @@ def _build_kan(width, params, device):
         save_act=False,
         device=str(device),
     )
+
+
+class SeqKAN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, kan_params=None, device=None):
+        super().__init__()
+        if kan_params is None:
+            kan_params = dict(
+                hidden=dict(grid=20, k=3, grid_range=(-10, 10)),
+                output=dict(grid=20, k=3, grid_range=(-10, 10)),
+            )
+        self.hidden_size = int(hidden_size)
+        self.device = torch.device("cpu") if device is None else torch.device(device)
+        self.kan_x = _build_kan(
+            width=[input_size, hidden_size],
+            params=kan_params["hidden"],
+            device=self.device,
+        )
+        self.kan_h = _build_kan(
+            width=[hidden_size, hidden_size],
+            params=kan_params["hidden"],
+            device=self.device,
+        )
+        # z_t: sequência paralela
+        self.kan_zx = _build_kan(
+            width=[input_size, hidden_size],
+            params=kan_params["hidden"],
+            device=self.device,
+        )
+        self.kan_zz = _build_kan(
+            width=[hidden_size, hidden_size],
+            params=kan_params["hidden"],
+            device=self.device,
+        )
+        self.kan_out = _build_kan(
+            width=[hidden_size, output_size],
+            params=kan_params["output"],
+            device=self.device,
+        )
+
+        # Top-k sparsity (activation-level) config
+        topk_cfg = kan_params.get("topk", {}) if isinstance(kan_params, dict) else {}
+        self.topk_enabled = bool(topk_cfg.get("enabled", False))
+        self.topk_k_by_target = topk_cfg.get("k_by_target", {})
+        self.topk_warmup_epochs = int(topk_cfg.get("warmup_epochs", 0) or 0)
+        self.topk_targets = set(topk_cfg.get("targets", ["s1", "h_rec"]))
+        self.topk_mode = str(topk_cfg.get("mode", "hard")).lower()
+        self.topk_temp = float(topk_cfg.get("temp", 0.1))
+        self.last_topk_ratio = {}
+        self.current_epoch = None
+
+    def _apply_topk(self, x, name: str | None = None):
+        if not self.topk_enabled:
+            return x
+        if self.current_epoch is None or self.current_epoch <= self.topk_warmup_epochs:
+            return x
+        k_cfg = self.topk_k_by_target.get(name, None) if name is not None else None
+        if k_cfg is None:
+            return x
+        k = int(k_cfg)
+        if k <= 0 or k >= x.size(-1):
+            return x
+        scores = x.abs()
+        vals, idx = torch.topk(scores, k=k, dim=-1)
+        # hard mask (top-k by abs)
+        mask = torch.zeros_like(x, dtype=torch.bool)
+        mask.scatter_(dim=-1, index=idx, value=True)
+        if self.topk_mode == "soft":
+            # soft gate around k-th threshold
+            kth = vals[..., -1, None]
+            gate = torch.sigmoid((scores - kth) / max(self.topk_temp, 1e-6))
+            out = x * gate
+            ratio = gate.mean().detach().item()
+        else:
+            out = torch.where(mask, x, torch.zeros_like(x))
+            ratio = mask.float().mean().detach().item()
+        if name is not None:
+            self.last_topk_ratio[name] = ratio
+        return out
+
+    def forward(self, x, mask=None, return_last=False):
+        if next(self.parameters()).device != x.device:
+            self.to(x.device)
+        batch_size, seq_len, _ = x.shape
+        hidden_state = torch.zeros(batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
+        z_state = torch.zeros(batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
+        outputs = []
+        for t in range(seq_len):
+            x_t = x[:, t, :]
+            s1 = self.kan_x(x_t)
+            if "s1" in self.topk_targets:
+                s1 = self._apply_topk(s1, name="s1")
+            if mask is None:
+                m = 1.0
+            else:
+                m_t = mask[:, t, :]
+                if m_t.shape[1] != self.hidden_size:
+                    m = m_t.any(dim=1, keepdim=True).float()
+                else:
+                    m = m_t.float()
+            # z_t em paralelo (usa todo z_{t-1})
+            z_prev = z_state
+            z_state = self.kan_zx(x_t) + self.kan_zz(z_prev)
+            if "z" in self.topk_targets:
+                z_state = self._apply_topk(z_state, name="z")
+            # h_t com recorrência explícita via KAN_h
+            h_prev = hidden_state
+            h_rec = self.kan_h(h_prev)
+            if "h_rec" in self.topk_targets:
+                h_rec = self._apply_topk(h_rec, name="h_rec")
+            hidden_state = h_rec + m * s1 + (1 - m) * z_prev
+            output_t = self.kan_out(hidden_state)
+            outputs.append(output_t)
+        outputs = torch.stack(outputs, dim=1)
+        last = outputs[:, -1, :]
+        return (outputs, last) if return_last else outputs
 
 
 class SeqKANSeq(nn.Module):
@@ -188,7 +302,7 @@ class SeqKANCore(nn.Module):
         input_dim = self.hidden_dim if input_dim is None else int(input_dim)
         output_dim = self.hidden_dim if output_dim is None else int(output_dim)
         self.variational_dropout = float(max(0.0, variational_dropout))
-        self.seqkan = SeqKANSeq(
+        self.seqkan = SeqKAN(
             input_size=input_dim,
             hidden_size=self.hidden_dim,
             output_size=output_dim,
@@ -215,7 +329,7 @@ class SeqKANEncoder(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.variational_dropout = float(max(0.0, variational_dropout))
         self.use_layernorm = use_layernorm
-        self.seqkan = SeqKANSeq(
+        self.seqkan = SeqKAN(
             input_size=self.in_dim,
             hidden_size=self.hidden_dim,
             output_size=self.hidden_dim,
@@ -267,344 +381,6 @@ class TS_seqKANSeq(nn.Module):
     def forward(self, x, mask=None):
         return self.seq(x, mask=mask)
 
-    def _apply_diffusion(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        return x
-
-    def _make_random_mask(self, x, ts_batch, m, device, generator=None, num_steps: int = 1000, max_drop: float = 0.3):
-        t_mask = torch.randint(0, num_steps, (x.size(0),), device=device, generator=generator)
-        t_mask_ts = torch.randint(0, num_steps, (x.size(0),), device=device, generator=generator)
-        p_drop_t = (t_mask.float() / (num_steps - 1)) * max_drop
-        p_drop_t = p_drop_t.view(-1, 1, 1)
-        p_drop_ts = (t_mask_ts.float() / (num_steps - 1)) * max_drop
-        p_drop_ts = p_drop_ts.view(-1, 1)
-        rand_mask = (torch.rand(m.shape, device=device, generator=generator) > p_drop_t).float()
-        rand_mask_ts = (torch.rand(ts_batch.shape, device=device, generator=generator) > p_drop_ts).unsqueeze(-1).float()
-        rand_mask_ts[:, -1, 0] = 0
-        return m * rand_mask * rand_mask_ts
-
-    def test_model(
-        self,
-        loader: DataLoader,
-        y_seq,
-        all_groups=None,
-        only_gru=False,
-        reconstruction_test: bool = False,
-        status_pred_window: int = 600,
-        x_max: float | None = None,
-        x_min: float | None = None,
-        y_idx: list[int] | None = None,
-        cost_mask_t: torch.Tensor | None = None,
-        use_rebuild: bool | None = None,
-        use_forecast: bool | None = None,
-    ):
-        _ = only_gru
-        _ = status_pred_window
-        if y_seq is None:
-            y_seq = np.zeros(len(loader.dataset), dtype=int)
-        y_seq = np.asarray(y_seq, dtype=int)
-        if reconstruction_test:
-            eval_mask_seed = globals().get("eval_mask_seed", None)
-            if eval_mask_seed is not None:
-                return self._test_model(
-                    loader,
-                    y_seq,
-                    all_groups,
-                    reconstruction_test,
-                    x_max=x_max,
-                    x_min=x_min,
-                    y_idx=y_idx,
-                    cost_mask_t=cost_mask_t,
-                    use_rebuild=use_rebuild,
-                    use_forecast=use_forecast,
-                    eval_mask_seed=eval_mask_seed,
-                )
-            res = [
-                self._test_model(
-                    loader,
-                    y_seq,
-                    all_groups,
-                    reconstruction_test,
-                    x_max=x_max,
-                    x_min=x_min,
-                    y_idx=y_idx,
-                    cost_mask_t=cost_mask_t,
-                    use_rebuild=use_rebuild,
-                    use_forecast=use_forecast,
-                    eval_mask_seed=None,
-                )
-                for _ in range(13)
-            ]
-            micro_vals = [r["micro_mse"] for r in res]
-            r = float(np.median(micro_vals))
-            idx = micro_vals.index(r)
-            return res[idx]
-        return self._test_model(
-            loader,
-            y_seq,
-            all_groups,
-            reconstruction_test,
-            x_max=x_max,
-            x_min=x_min,
-            y_idx=y_idx,
-            cost_mask_t=cost_mask_t,
-            use_rebuild=use_rebuild,
-            use_forecast=use_forecast,
-            eval_mask_seed=None,
-        )
-
-    def _test_model(
-        self,
-        loader: DataLoader,
-        y_seq,
-        all_groups=None,
-        reconstruction_test: bool = False,
-        x_max: float | None = None,
-        x_min: float | None = None,
-        y_idx: list[int] | None = None,
-        cost_mask_t: torch.Tensor | None = None,
-        use_rebuild: bool | None = None,
-        use_forecast: bool | None = None,
-        eval_mask_seed: int | None = None,
-    ):
-        def _clip_batch_x(x: torch.Tensor) -> torch.Tensor:
-            if x_min is not None:
-                x = torch.maximum(x, x.new_tensor(x_min))
-            if x_max is not None:
-                x = torch.minimum(x, x.new_tensor(x_max))
-            return x
-
-        device = next(self.parameters()).device
-        self.eval()
-        y_seq = np.asarray(y_seq, dtype=int)
-        pos = 0
-
-        if use_rebuild is None or use_forecast is None:
-            lam = list(getattr(self, "lam", [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]))
-            use_rebuild = lam[0] > 0 if use_rebuild is None else use_rebuild
-            use_forecast = lam[1] > 0 if use_forecast is None else use_forecast
-        if use_rebuild:
-            mode = "rebuild"
-        elif use_forecast:
-            mode = "forecast"
-        else:
-            raise ValueError("test_model: use_rebuild ou use_forecast deve ser True.")
-
-        if mode == "forecast" and not y_idx:
-            raise ValueError("test_model: y_idx obrigatorio em modo forecast.")
-
-        # acumuladores por grupo
-        G_W = {}
-        G_SSE = {}
-        G_WM2 = {}
-        G_MSE = {}
-        G_CNT = {}
-
-        # globais (micro)
-        T_W, T_SSE, T_WM2 = 0.0, 0.0, 0.0
-
-        gen = None
-        if reconstruction_test and eval_mask_seed is not None:
-            gen = torch.Generator(device=device)
-            gen.manual_seed(eval_mask_seed)
-
-        with torch.no_grad():
-            for batch in loader:
-                x, ts_batch, m = batch[0], batch[1], batch[2]
-                x, ts_batch, m = x.to(device), ts_batch.to(device), m.to(device)
-                if x_min is not None:
-                    x = torch.maximum(x, x.new_tensor(x_min))
-                if x_max is not None:
-                    x = torch.minimum(x, x.new_tensor(x_max))
-
-                B = x.shape[0]
-                yb = y_seq[pos:pos + B]
-                if len(yb) != B:
-                    raise ValueError(f"test_model: desalinhado (batch={B}, labels={len(yb)} a partir de pos={pos}).")
-                pos += B
-
-                if reconstruction_test:
-                    m_train = self._make_random_mask(x, ts_batch, m, device, generator=gen)
-                else:
-                    m_train = m.clone()
-                    m_train[:, -1, :] = 0.0
-
-                x_masked = x * m_train
-                pred_out = self.seq(x_masked, mask=m_train)
-                if isinstance(pred_out, tuple):
-                    pred_main, pred_rebuild = pred_out
-                else:
-                    pred_main, pred_rebuild = pred_out, None
-
-                if mode == "rebuild":
-                    x_hat = pred_rebuild if pred_rebuild is not None else pred_main
-                    x_target = x
-                    m_eval = m
-                    m_train_eval = m_train
-                    cc = torch.ones_like(x_target) if cost_mask_t is None else cost_mask_t.to(device)
-                else:
-                    x_hat = pred_main
-                    idx = torch.tensor(y_idx, device=device, dtype=torch.long)
-                    x_target = x.index_select(dim=2, index=idx)
-                    m_eval = m.index_select(dim=2, index=idx)
-                    m_train_eval = m_train.index_select(dim=2, index=idx)
-                    if cost_mask_t is None:
-                        cc = torch.ones_like(x_target)
-                    else:
-                        cc = cost_mask_t.to(device).index_select(dim=2, index=idx)
-
-                if x_hat is None:
-                    x_hat = x_target
-                x_hat = _clip_batch_x(x_hat)
-                x_target = _clip_batch_x(x_target)
-
-                mask_err = m_eval * (1.0 - m_train_eval)
-                sse_bt = ((x_target - x_hat) ** 2 * mask_err * cc).sum(dim=(1, 2))
-                nobs_bt = (mask_err * cc).sum(dim=(1, 2)).clamp(min=1.0)
-                mse_bt = (sse_bt / nobs_bt).detach().cpu().numpy()
-                sse_bt = sse_bt.detach().cpu().numpy()
-                nobs_bt = nobs_bt.detach().cpu().numpy()
-
-                for b in range(B):
-                    g = int(yb[b])
-                    w = float(nobs_bt[b])
-                    mse = float(mse_bt[b])
-                    sse = float(sse_bt[b])
-                    G_W[g] = G_W.get(g, 0.0) + w
-                    G_SSE[g] = G_SSE.get(g, 0.0) + sse
-                    G_WM2[g] = G_WM2.get(g, 0.0) + (w * mse * mse)
-                    G_MSE.setdefault(g, []).append(mse)
-                    G_CNT[g] = G_CNT.get(g, 0) + 1
-
-                    T_W += w
-                    T_SSE += sse
-                    T_WM2 += (w * mse * mse)
-
-        if all_groups is None:
-            groups = sorted(G_W.keys())
-        else:
-            groups = sorted(np.unique(list(all_groups)).tolist())
-
-        if not groups:
-            return {
-                "macro_mse": float("nan"), "macro_se": float("nan"),
-                "micro_mse": float("nan"), "micro_se": float("nan"),
-                "per_group_mse": {}, "per_group_se_w": {}, "per_group_se_unw": {},
-                "per_group_counts": {}, "per_group_sum_nobs": {},
-                "macro_mse_n": float("nan"), "macro_se_n": float("nan"),
-                "micro_mse_n": float("nan"), "micro_se_n": float("nan"),
-                "per_group_mse_n": {}, "per_group_se_w_n": {}, "per_group_se_unw_n": {},
-                "per_group_sum_nobs_n": {},
-                "macro_mse_s": float("nan"), "macro_se_s": float("nan"),
-                "micro_mse_s": float("nan"), "micro_se_s": float("nan"),
-                "per_group_mse_s": {}, "per_group_se_w_s": {}, "per_group_se_unw_s": {},
-                "per_group_sum_nobs_s": {},
-                "macro_mse_v": float("nan"), "macro_se_v": float("nan"),
-                "micro_mse_v": float("nan"), "micro_se_v": float("nan"),
-                "per_group_mse_v": {}, "per_group_se_w_v": {}, "per_group_se_unw_v": {},
-                "per_group_sum_nobs_v": {},
-                "macro_mse_vt": float("nan"), "macro_se_vt": float("nan"),
-                "micro_mse_vt": float("nan"), "micro_se_vt": float("nan"),
-                "per_group_mse_vt": {}, "per_group_se_w_vt": {}, "per_group_se_unw_vt": {},
-                "per_group_sum_nobs_vt": {},
-                "micro_nll_v": float("nan"), "micro_nll_vt": float("nan"),
-                "macro_nll_v": float("nan"), "macro_nll_vt": float("nan"),
-                "micro_elbo_v": float("nan"), "micro_elbo_vt": float("nan"),
-                "macro_elbo_v": float("nan"), "macro_elbo_vt": float("nan"),
-                "per_group_elbo_v": {}, "per_group_elbo_vt": {},
-                "micro_cov_v": float("nan"), "micro_cov_vt": float("nan"),
-                "macro_cov_v": float("nan"), "macro_cov_vt": float("nan"),
-                "micro_width_v": float("nan"), "micro_width_vt": float("nan"),
-                "macro_width_v": float("nan"), "macro_width_vt": float("nan"),
-            }
-
-        per_group_mse = {}
-        per_group_se_w = {}
-        per_group_se_unw = {}
-        per_group_counts = {}
-        per_group_sum_nobs = {}
-
-        for g in groups:
-            Wg = G_W.get(g, 0.0)
-            per_group_sum_nobs[g] = float(Wg)
-            cnt = G_CNT.get(g, 0)
-            per_group_counts[g] = int(cnt)
-            if Wg > 0.0:
-                mu_g = G_SSE[g] / Wg
-                per_group_mse[g] = float(mu_g)
-                mses = np.asarray(G_MSE.get(g, []), dtype=float)
-                if mses.size >= 2:
-                    std_unw = float(np.std(mses, ddof=1))
-                    per_group_se_unw[g] = std_unw / math.sqrt(mses.size)
-                else:
-                    per_group_se_unw[g] = float("nan")
-                s2_w = max(G_WM2[g] / Wg - mu_g * mu_g, 0.0)
-                if cnt >= 2:
-                    n_eff = cnt
-                    per_group_se_w[g] = float(math.sqrt(s2_w / n_eff))
-                else:
-                    per_group_se_w[g] = float("nan")
-            else:
-                per_group_mse[g] = float("nan")
-                per_group_se_unw[g] = float("nan")
-                per_group_se_w[g] = float("nan")
-
-        if T_W > 0.0:
-            micro_mse = T_SSE / T_W
-            s2_micro = max(T_WM2 / T_W - micro_mse * micro_mse, 0.0)
-            total_cnt = int(sum(per_group_counts.values()))
-            micro_se = float(math.sqrt(s2_micro / max(total_cnt, 1)))
-        else:
-            micro_mse = float("nan")
-            micro_se = float("nan")
-
-        mu_gs = [per_group_mse[g] for g in groups if np.isfinite(per_group_mse[g])]
-        G_eff = len(mu_gs)
-        if G_eff >= 1:
-            macro_mse = float(np.mean(mu_gs))
-            if G_eff >= 2:
-                std_between = float(np.std(mu_gs, ddof=1))
-                macro_se = std_between / math.sqrt(G_eff)
-            else:
-                macro_se = float("nan")
-        else:
-            macro_mse = float("nan")
-            macro_se = float("nan")
-
-        return {
-            "macro_mse": macro_mse, "macro_se": macro_se,
-            "micro_mse": micro_mse, "micro_se": micro_se,
-            "per_group_mse": per_group_mse,
-            "per_group_se_w": per_group_se_w,
-            "per_group_se_unw": per_group_se_unw,
-            "per_group_counts": per_group_counts,
-            "per_group_sum_nobs": per_group_sum_nobs,
-            "macro_mse_n": float("nan"), "macro_se_n": float("nan"),
-            "micro_mse_n": float("nan"), "micro_se_n": float("nan"),
-            "per_group_mse_n": {}, "per_group_se_w_n": {}, "per_group_se_unw_n": {},
-            "per_group_sum_nobs_n": {},
-            "macro_mse_s": float("nan"), "macro_se_s": float("nan"),
-            "micro_mse_s": float("nan"), "micro_se_s": float("nan"),
-            "per_group_mse_s": {}, "per_group_se_w_s": {}, "per_group_se_unw_s": {},
-            "per_group_sum_nobs_s": {},
-            "macro_mse_v": float("nan"), "macro_se_v": float("nan"),
-            "micro_mse_v": float("nan"), "micro_se_v": float("nan"),
-            "per_group_mse_v": {}, "per_group_se_w_v": {}, "per_group_se_unw_v": {},
-            "per_group_sum_nobs_v": {},
-            "macro_mse_vt": float("nan"), "macro_se_vt": float("nan"),
-            "micro_mse_vt": float("nan"), "micro_se_vt": float("nan"),
-            "per_group_mse_vt": {}, "per_group_se_w_vt": {}, "per_group_se_unw_vt": {},
-            "per_group_sum_nobs_vt": {},
-            "micro_nll_v": float("nan"), "micro_nll_vt": float("nan"),
-            "macro_nll_v": float("nan"), "macro_nll_vt": float("nan"),
-            "micro_elbo_v": float("nan"), "micro_elbo_vt": float("nan"),
-            "macro_elbo_v": float("nan"), "macro_elbo_vt": float("nan"),
-            "per_group_elbo_v": {}, "per_group_elbo_vt": {},
-            "micro_cov_v": float("nan"), "micro_cov_vt": float("nan"),
-            "macro_cov_v": float("nan"), "macro_cov_vt": float("nan"),
-            "micro_width_v": float("nan"), "micro_width_vt": float("nan"),
-            "macro_width_v": float("nan"), "macro_width_vt": float("nan"),
-        }
-
     def train_cognite(
         self,
         df,
@@ -649,7 +425,6 @@ class TS_seqKANSeq(nn.Module):
             # compatibilidade: usa rebuild flag para definir lam default
             lam = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0] if rebuild else [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         lam = list(lam)
-        self.lam = list(lam)
         if len(lam) < 2:
             raise ValueError("lam deve ter ao menos dois termos (rebuild e forecast).")
         use_rebuild = lam[0] > 0
@@ -802,11 +577,6 @@ class TS_seqKANSeq(nn.Module):
             print(f"GRUPOS (train): {_count_groups(train_idx)}")
             print(f"GRUPOS (valid): {_count_groups(val_idx) if validate else {}}")
             print(f"GRUPOS (test):  {_count_groups(test_idx)}")
-            y_seq_full = np.asarray(groups, dtype=int)
-            all_groups = groups
-        else:
-            y_seq_full = np.zeros(len(x_seq), dtype=int)
-            all_groups = None
 
         # --- RobustScaler (igual ODEJump/TSDiffusion): fit no treino e aplica em tudo ---
         if use_robust_scaler:
@@ -860,34 +630,26 @@ class TS_seqKANSeq(nn.Module):
 
         if debug_batch_stats:
             names = debug_batch_stats_names if debug_batch_stats_names is not None else feature_cols
+            x_all = vals
+            pct2 = float(np.mean(np.abs(x_all) > 2) * 100.0)
+            pct3 = float(np.mean(np.abs(x_all) > 3) * 100.0)
+            pct4 = float(np.mean(np.abs(x_all) > 4) * 100.0)
+            p1, p50, p99 = np.percentile(x_all, [1, 50, 99])
+            min_feat_idx = int(np.argmin(x_all.min(axis=0)))
+            max_feat_idx = int(np.argmax(x_all.max(axis=0)))
+            worst_min_feature = names[min_feat_idx] if min_feat_idx < len(names) else str(min_feat_idx)
+            worst_max_feature = names[max_feat_idx] if max_feat_idx < len(names) else str(max_feat_idx)
 
-            def _print_stats(x_batch: torch.Tensor):
-                # stats do batch (apos clamp), para refletir o clamp
-                x_cpu = x_batch.detach().float().cpu()
-                x_flat = x_cpu.reshape(-1, x_cpu.shape[-1])
-                pct2 = float((x_flat.abs() > 2).float().mean().item() * 100.0)
-                pct3 = float((x_flat.abs() > 3).float().mean().item() * 100.0)
-                pct4 = float((x_flat.abs() > 4).float().mean().item() * 100.0)
-                x_min_val = float(x_flat.min().item())
-                x_max_val = float(x_flat.max().item())
-                p1 = float(torch.quantile(x_flat, 0.01).item())
-                p50 = float(torch.quantile(x_flat, 0.50).item())
-                p99 = float(torch.quantile(x_flat, 0.99).item())
-                per_feat_min = x_flat.min(dim=0).values
-                per_feat_max = x_flat.max(dim=0).values
-                min_feat_idx = int(torch.argmin(per_feat_min).item())
-                max_feat_idx = int(torch.argmax(per_feat_max).item())
-                worst_min_feature = names[min_feat_idx] if min_feat_idx < len(names) else str(min_feat_idx)
-                worst_max_feature = names[max_feat_idx] if max_feat_idx < len(names) else str(max_feat_idx)
+            def _print_stats():
                 print(f">% |x| > 2 : {pct2:.2f}%")
                 print(f">% |x| > 3 : {pct3:.2f}%")
                 print(f">% |x| > 4 : {pct4:.2f}%")
-                print(f"min: {x_min_val:.1f} max: {x_max_val:.1f}")
+                print(f"min: {x_all.min():.1f} max: {x_all.max():.1f}")
                 print(f"p1/p50/p99: [{p1:.6f} {p50:.6f} {p99:.6f}]")
-                print(f"worst_min_feature: {worst_min_feature} {per_feat_min[min_feat_idx].item():.1f}")
-                print(f"worst_max_feature: {worst_max_feature} {per_feat_max[max_feat_idx].item():.1f}")
+                print(f"worst_min_feature: {worst_min_feature} {x_all[:, min_feat_idx].min():.1f}")
+                print(f"worst_max_feature: {worst_max_feature} {x_all[:, max_feat_idx].max():.1f}")
         else:
-            def _print_stats(x_batch: torch.Tensor | None = None):
+            def _print_stats():
                 return
 
         optim_name = optimizer_name.lower()
@@ -948,8 +710,7 @@ class TS_seqKANSeq(nn.Module):
                     else:
                         m_train = mb.clone()
                         m_train[:, -1:, :] = 0
-                    x_in = self._apply_diffusion(xb, m_train)
-                    pred_out = self.seq(x_in, mask=m_train)
+                    pred_out = self.seq(xb, mask=m_train)
                     if isinstance(pred_out, tuple):
                         pred_main, pred_rebuild = pred_out
                     else:
@@ -1047,7 +808,7 @@ class TS_seqKANSeq(nn.Module):
             self.seq.current_epoch = ep
             self.seq.train()
             losses = []
-            printed_stats = False
+            _print_stats()
             for step, batch in enumerate(train_loader, 1):
                 xb, tsb, mb = batch[0], batch[1], batch[2]
                 idx = 3
@@ -1066,17 +827,13 @@ class TS_seqKANSeq(nn.Module):
                     stat = stat.to(self.device)
                 if den is not None:
                     den = den.to(self.device)
-                if debug_batch_stats and not printed_stats:
-                    _print_stats(xb)
-                    printed_stats = True
                 cm = cost_mask_t.to(self.device) if cost_mask_t is not None else None
                 if use_rebuild:
                     m_train = _make_random_mask(xb, tsb, mb, xb.device)
                 else:
                     m_train = mb.clone()
                     m_train[:, -1:, :] = 0
-                x_in = self._apply_diffusion(xb, m_train)
-                pred_out = self.seq(x_in, mask=m_train)
+                pred_out = self.seq(xb, mask=m_train)
                 if isinstance(pred_out, tuple):
                     pred_main, pred_rebuild = pred_out
                 else:
@@ -1117,57 +874,37 @@ class TS_seqKANSeq(nn.Module):
                 train_loss = float("nan")
 
             if val_loader is not None:
-                val_metrics = self.test_model(
-                    val_loader,
-                    y_seq=y_seq_full[val_idx],
-                    all_groups=all_groups,
-                    reconstruction_test=reconstruction_test,
-                    x_min=x_min,
-                    x_max=x_max,
-                    y_idx=y_idx if use_forecast else None,
-                    cost_mask_t=cost_mask_t,
-                    use_rebuild=use_rebuild,
-                    use_forecast=use_forecast,
-                )
-                val_loss = float(val_metrics["micro_mse"])
+                val_loss, val_h, val_mse_samples = eval_loader(val_loader)
             else:
-                val_metrics = None
-                val_loss = float("nan")
+                val_loss, val_h, val_mse_samples = float("nan"), None, np.array([])
 
-            test_metrics = self.test_model(
-                test_loader,
-                y_seq=y_seq_full[test_idx],
-                all_groups=all_groups,
-                reconstruction_test=reconstruction_test,
-                x_min=x_min,
-                x_max=x_max,
-                y_idx=y_idx if use_forecast else None,
-                cost_mask_t=cost_mask_t,
-                use_rebuild=use_rebuild,
-                use_forecast=use_forecast,
-            )
-            test_loss = float(test_metrics["micro_mse"])
+            test_loss, test_h, mse_samples = eval_loader(test_loader)
+            if groups is not None:
+                macro, micro, micro_se, per_group, per_group_se, per_group_counts = _group_metrics(mse_samples, groups[test_idx])
+                macro_se = _macro_se_from_groups(per_group)
+            else:
+                macro = float("nan")
+                micro = float(np.mean(mse_samples)) if len(mse_samples) else float("nan")
+                micro_se = float(np.std(mse_samples, ddof=1) / np.sqrt(len(mse_samples))) if len(mse_samples) >= 2 else float("nan")
+                macro_se = float("nan")
+                per_group = {}
+                per_group_se = {}
+                per_group_counts = {}
 
-            if val_metrics is not None:
-                val_macro = float(val_metrics["macro_mse"])
-                val_micro = float(val_metrics["micro_mse"])
-                val_micro_se = float(val_metrics["micro_se"])
-                val_macro_se = float(val_metrics["macro_se"])
+            if val_loader is not None and len(val_mse_samples):
+                if groups is not None:
+                    val_macro, val_micro, val_micro_se, val_pg, _, _ = _group_metrics(val_mse_samples, groups[val_idx])
+                    val_macro_se = _macro_se_from_groups(val_pg)
+                else:
+                    val_macro = float("nan")
+                    val_micro = float(np.mean(val_mse_samples))
+                    val_micro_se = float(np.std(val_mse_samples, ddof=1) / np.sqrt(len(val_mse_samples))) if len(val_mse_samples) >= 2 else float("nan")
+                    val_macro_se = float("nan")
             else:
                 val_macro = float("nan")
                 val_micro = float("nan")
                 val_micro_se = float("nan")
                 val_macro_se = float("nan")
-
-            macro = float(test_metrics["macro_mse"])
-            micro = float(test_metrics["micro_mse"])
-            micro_se = float(test_metrics["micro_se"])
-            macro_se = float(test_metrics["macro_se"])
-            per_group = test_metrics["per_group_mse"]
-            per_group_se = test_metrics["per_group_se_w"]
-            per_group_counts = test_metrics["per_group_counts"]
-            val_h = None
-            test_h = None
 
             print(
                 f"Epoch {ep}/{epochs} | Train(sampled) L1:{train_loss:.6f} L2:0.000000 L3:0.000000  L4:0.000000 L5:0.000000 L6:0.000000 | "
@@ -1198,7 +935,7 @@ class TS_seqKANSeq(nn.Module):
                 "val_macro": val_macro,
             }
 
-            # early stopping by val_micro (mesmo criterio do estado)
+            # early stopping by val_micro (mesmo criterio do zstate)
             score = val_micro if val_loader is not None else micro
             if score < best_val:
                 best_val = score
@@ -1212,7 +949,6 @@ class TS_seqKANSeq(nn.Module):
                     break
 
         yield None
-
 
 class TS_seqKAN(ODEJump):
     def __init__(
@@ -1516,239 +1252,6 @@ class TSDF_seqKAN(TSDiffusion):
                 ht = self.encoder_ode_tmax(h, timestamps, only_gru, mask=mask)
             else:
                 ht = self.encoder_ode_tmax(h, timestamps, only_gru, mask=mask)
-            tmax_hat = self.tmax_head(ht)
-        else:
-            ht = None
-            tmax_hat = None
-        if self.lam[4] > 0:
-            mu_logvar = self.vae_latent(h)
-            vae_mu, vae_logvar = torch.chunk(mu_logvar, 2, dim=-1)
-            std = torch.exp(0.5 * vae_logvar)
-            eps = torch.randn_like(std)
-            z_vae = vae_mu + eps * std
-            vae_x = self.vae_decoder(z_vae)
-            vae_logvar_obs = self.vae_sigma_head(z_vae).clamp(min=-5.0, max=5.0)
-
-        if self.lam[5] > 0 and ht is not None:
-            mu_logvar_t = self.vae_tmax_latent(ht)
-            vae_tmax_mu, vae_tmax_logvar = torch.chunk(mu_logvar_t, 2, dim=-1)
-            std_t = torch.exp(0.5 * vae_tmax_logvar)
-            eps_t = torch.randn_like(std_t)
-            z_tmax = vae_tmax_mu + eps_t * std_t
-            vae_tmax = self.vae_tmax_decoder(z_tmax)
-            vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax).clamp(min=-5.0, max=5.0)
-
-        x_hat = self.decoder(h) if return_x_hat and self.lam[0] > 0 else None
-
-        return (
-            h,
-            h,
-            ht,
-            x_hat,
-            tmax_hat,
-            noise,
-            noise_hat,
-            vae_x,
-            vae_mu,
-            vae_logvar,
-            vae_tmax,
-            vae_tmax_mu,
-            vae_tmax_logvar,
-            vae_logvar_obs if "vae_logvar_obs" in locals() else None,
-            vae_tmax_logvar_obs if "vae_tmax_logvar_obs" in locals() else None,
-        )
-
-
-class TSDF_seqKANSeq(TSDiffusion):
-    """
-    TSDiffusion com backbone SeqKANSeq (difusao no latente, mesmo esquema do TSDiffusion).
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_dim: int = 256,
-        static_dim: int = 0,
-        status_dim: int = 0,
-        lam: list[float, float, float, float, float, float] = [0.9, 0.0, 0.0, 0.1, 0.0, 0.0],
-        num_steps: int = 1000,
-        cost_columns: list = None,
-        bi_gru: bool = False,
-        bi_method: str = "concat",
-        bi_coupled: bool = False,
-        log_likelihood: bool = False,
-        variational_dropout: float = 0.0,
-        use_layernorm: bool = True,
-        sigma_temp: float = 0.7,
-        kan_params: dict | None = None,
-        direct_x: bool = True,
-        feature_scale: bool = False,
-    ):
-        if bi_gru:
-            raise ValueError("seqKAN core does not support bi_gru.")
-        super().__init__(
-            in_channels=in_channels,
-            hidden_dim=hidden_dim,
-            static_dim=static_dim,
-            lam=lam,
-            num_steps=num_steps,
-            cost_columns=cost_columns,
-            status_dim=status_dim,
-            log_likelihood=log_likelihood,
-            sigma_temp=sigma_temp,
-        )
-        self.direct_x = bool(direct_x)
-        self.feature_scale = bool(feature_scale)
-        if self.feature_scale:
-            self.feature_scale_log = nn.Parameter(torch.zeros(in_channels))
-        self._warned_mask_none = False
-        if not self.direct_x:
-            self.encoder = nn.Sequential(
-                nn.Linear(in_channels * 2, hidden_dim),
-                nn.ReLU(),
-            )
-            self.state_dim = hidden_dim
-        else:
-            self.encoder = None
-            self.state_dim = in_channels
-
-        self.static_dim = static_dim
-        if static_dim > 0:
-            self.static_proj = nn.Sequential(
-                nn.Linear(static_dim, in_channels if self.direct_x else hidden_dim),
-                nn.ReLU(),
-            )
-
-        if status_dim > 0:
-            self.tmax_head = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, status_dim),
-            )
-            self.encoder_ode_tmax = SeqKANSeq(
-                input_size=self.state_dim,
-                hidden_size=hidden_dim,
-                output_size=self.state_dim,
-                kan_params=kan_params,
-            )
-            if self.log_likelihood:
-                self.lambda_tmax_head = nn.Sequential(
-                    nn.Linear(self.state_dim, hidden_dim // 2),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim // 2, 1),
-                )
-        if self.lam[3] > 0.0:
-            self.miss_head = nn.Linear(self.state_dim, 1)
-        if self.lam[0] > 0.0 or self.lam[4] > 0.0:
-            self.encoder_ode_x = SeqKANSeq(
-                input_size=self.state_dim,
-                hidden_size=hidden_dim,
-                output_size=self.state_dim,
-                kan_params=kan_params,
-            )
-            self.decoder = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim // 2, in_channels),
-            )
-            if log_likelihood:
-                self.lambda_head = nn.Sequential(
-                    nn.Linear(self.state_dim, hidden_dim // 2),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim // 2, 1),
-                )
-        if self.lam[4] > 0:
-            self.vae_latent = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            )
-            self.vae_decoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, in_channels),
-            )
-            self.vae_sigma_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, in_channels),
-            )
-        if self.lam[5] > 0 and status_dim > 0:
-            self.vae_tmax_latent = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            )
-            self.vae_tmax_decoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim // 2, status_dim),
-            )
-            self.vae_tmax_sigma_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim // 2, status_dim),
-            )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor = None,
-        timestamps: torch.Tensor = None,
-        static_feats: torch.Tensor = None,
-        already_latent: bool = False,
-        return_x_hat: bool = False,
-        mask: torch.Tensor = None,
-        mask_ts: torch.Tensor = None,
-        test: bool = True,
-        only_gru: bool = False,
-    ) -> torch.Tensor:
-        noise = None
-        noise_hat = None
-        vae_x = None
-        vae_mu = None
-        vae_logvar = None
-        vae_tmax = None
-        vae_tmax_mu = None
-        vae_tmax_logvar = None
-        vae_tmax_logvar_obs = None
-        vae_logvar_obs = None
-        t = t if t is not None else torch.randint(0, self.num_steps, (x.size(0),), device=x.device)
-        if mask_ts is None and mask is not None:
-            mask_ts = mask.any(dim=2, keepdim=True).float()
-        if self.feature_scale and not already_latent:
-            scale = self.feature_scale_log.exp().view(1, 1, -1)
-            x = x * scale
-        if self.direct_x and mask is None:
-            if not self._warned_mask_none:
-                warnings.warn(
-                    "TSDF_seqKANSeq: mask=None with direct_x=True; using all-ones mask.",
-                    stacklevel=2,
-                )
-                self._warned_mask_none = True
-            mask = torch.ones_like(x)
-        if mask_ts is None:
-            mask_ts = mask.any(dim=2, keepdim=True).float()
-        if not already_latent:
-            if self.direct_x:
-                h = x
-            else:
-                h = self.encoder(torch.cat([x, mask], dim=-1))
-            if not test and self.lam[1] > 0:
-                noise = torch.randn_like(h) * mask_ts
-                ab = self.alpha_bar[t].view(-1, 1, 1)
-                h = torch.sqrt(ab) * h + torch.sqrt(1 - ab) * noise
-            else:
-                t = torch.zeros((x.size(0),), device=x.device, dtype=torch.long)
-                noise = None
-        else:
-            h = x
-        if static_feats is not None and self.static_dim > 0:
-            se = self.static_proj(static_feats).unsqueeze(1)
-            h = h + se
-        if self.lam[0] > 0 or self.lam[4] > 0:
-            h = self.encoder_ode_x(h, mask=mask)
-        if self.lam[2] > 0 or self.lam[5] > 0:
-            ht = self.encoder_ode_tmax(h, mask=mask)
             tmax_hat = self.tmax_head(ht)
         else:
             ht = None

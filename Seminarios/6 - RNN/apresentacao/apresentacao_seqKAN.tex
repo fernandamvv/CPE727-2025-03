@@ -139,28 +139,6 @@ B_{i,k}(x) &= \frac{x-t_i}{t_{i+k}-t_i} B_{i,k-1}(x) + \frac{t_{i+k+1}-x}{t_{i+k
 \end{frame}
 
 
-\begin{frame}{Spline Aux Residual na Saída}
-\small
-\textbf{Intenção:} Corrigir comportamento nos extremos (cauda), mantendo a região central inalterada.
-
-\textbf{Caminho paralelo com $z_{t-1}$:}
-No modelo base, o caminho paralelo com $z_{t-1}$ atua \emph{dentro} da dinâmica do estado:
-$h_t \leftarrow h_{t-1} + m\,\mathrm{KAN}_x(x_t) + (1-m)\,z_{t-1}$.
-Ou seja, $z_{t-1}$ é uma segunda memória recorrente que interfere na atualização de $h_t$.
-
-\textbf{Spline Aux residual na saída:}
-A AuxSpline atua \emph{fora} da dinâmica: ela adiciona um \emph{corretor direto na saída},
-somando um resíduo $\Delta y_t$ calculado a partir de $x_t$, sem alterar $h_t$.
-
-\textbf{Residual na saída:}
-$y_t=\mathrm{KAN}_{out}(h_t) + \alpha\,g(x_t)\,\mathrm{KAN}^{aux}_{out}(x_t)$,
-com gate ativando o resíduo apenas fora da faixa nominal:
-$g=\sigma(\alpha_x(|x_t|-2))$.
-
-
-\end{frame}
-
-
 
 \begin{frame}{Diagrama da Arquitetura}
 \centering
@@ -173,48 +151,42 @@ $g=\sigma(\alpha_x(|x_t|-2))$.
 ]
   % Coordenadas fixas para evitar cruzamentos
   \node[box] (x)      at (0, 0) {$x_t$};
-  \node[box] (kanx)   at (2.6, 0) {$\mathrm{KAN}_x$};
-  \node[sum] (sumh)   at (5.0, 0) {};
-  \node[box] (h)      at (6.8, 0) {$h_t$};
-  \node[box] (kanout) at (9.2, 0) {$\mathrm{KAN}_{out}$};
-  \node[sum] (sumy)   at (11.6, 0) {};
-  \node[box] (y)      at (13.6, 0) {$y_t$};
+  \node[box] (kanx)   at (5.0, 0) {$\mathrm{KAN}_x$};
+  \node[sum] (sumh)   at (7.4, 0) {};
+  \node[box] (h)      at (9.2, 0) {$h_t$};
+  \node[box] (kanout) at (11.6, 0) {$\mathrm{KAN}_{out}$};
+  \node[sum] (sumy)   at (14.0, 0) {};
+  \node[box] (y)      at (16.0, 0) {$y_t$};
 
   % Linha paralela (z)
-  \node[box] (kanzx)  at (2.6, -2.0) {$\mathrm{KAN}_{zx}(x_t)$};
-  \node[sum] (sumz)   at (5.0, -2.0) {};
-  \node[box] (z)      at (6.8, -2.0) {$z_t$};
-  \node[box] (kanzz)  at (10.2, -2.0) {$\mathrm{KAN}_{zz}(z_{t-1})$};
+  \node[box] (kanzx)  at (5.0, -2.0) {$\mathrm{KAN}_{zx}(x_t)$};
+  \node[sum] (sumz)   at (7.4, -2.0) {};
+  \node[box] (z)      at (9.2, -2.0) {$z_t$};
+  \node[box] (kanzz)  at (12.8, -2.0) {$\mathrm{KAN}_{zz}(z_{t-1})$};
 
-  % Gate e aux
-  \node[box] (gate)   at (5.0, 1.7) {$m=\mathrm{gate}(x_t)$};
-  \node[box] (aux)    at (11.6, -3.2) {$\mathrm{KAN}^{aux}_{out}$};
-  \node[box] (gaux)   at (11.6, -4.4) {$g(x_t)=\sigma(\alpha_x(|x_t|-2))$};
+  % Máscara (missing) e aux
+  \node[box] (gate)   at (2.4, 0) {$m=\mathbb{1}_{\mathrm{obs}}(x_t)$};
 
-  % Linha principal
-  \draw[arrow] (x) -- (kanx) -- (sumh) -- (h) -- (kanout) -- (sumy) -- (y);
+
+  % Linha principal (a partir de KANx)
+  \draw[arrow] (kanx) -- (sumh) -- (h) -- (kanout) -- (sumy) -- (y);
 
   % Linha z (sem cruzar caixas)
-  \draw[arrow] (x.south) |- (kanzx.west);
   \draw[arrow] (kanzx) -- (sumz) -- (z);
-  \node[draw, minimum width=7mm, minimum height=4mm, font=\tiny] (zdelay) at (8.5, -2.0) {$z^{-1}$};
+  \node[draw, minimum width=7mm, minimum height=4mm, font=\tiny] (zdelay) at (10.8, -2.0) {$z^{-1}$};
   \draw[arrow] (z) -- (zdelay) -- node[midway, above, yshift=3mm] {\tiny $z_{t-1}$} (kanzz);
   \draw[arrow] (kanzz.south) |- ([yshift=-4mm]sumz.south) -- (sumz.south);
   \draw[arrow] (zdelay.north) -- (sumh.south);
 
-  % Gate
-  \draw[arrow] (x.north) -- ++(0,0.6) |- (gate.west);
-  \draw[arrow] (gate) -- (sumh);
-  \node[above right=1mm of sumh] {\tiny $m$};
+  % Máscara de observação (split)
+  \draw[arrow] (x) -- (gate);
+  \draw[arrow] (gate) -- node[midway, above] {\tiny $m$} (kanx.west);
+  \draw[arrow] (gate) -- node[midway, above] {\tiny $1-m$} (kanzx.west);
 
-  % Aux residual
-  \draw[arrow] (x.south) |- (gaux.west);
-  \draw[arrow] (gaux.north) -- (aux.south);
-  \draw[arrow] (aux.north) -- (sumy.south) node[midway, right] {\tiny $\alpha\,g(x_t)$};
-
-  % Labels
+   % Labels
   \node[above=2mm of h, xshift=6mm] {\tiny $h_t \leftarrow h_{t-1} + m\,\mathrm{KAN}_x(x_t) + (1-m)\,z_{t-1}$};
-  \node[above=2mm of y] {\tiny $y_t=\mathrm{KAN}_{out}(h_t) + \alpha\,g(x_t)\,\mathrm{KAN}^{aux}_{out}(x_t)$};
+  \node[below=1mm of z] {\tiny $z_t=\mathrm{KAN}_{zx}(x_t)+\mathrm{KAN}_{zz}(z_{t-1})$};
+  \node[above=2mm of y] {\tiny $y_t=\mathrm{KAN}_{out}(h_t)$};
 \end{tikzpicture}
 }
 \end{frame}
@@ -229,72 +201,107 @@ $g=\sigma(\alpha_x(|x_t|-2))$.
 \end{frame}
 
 \section{Resultados}
+
+
+
+
 \begin{frame}{Resultados Globais}
-\centering
-\begin{table}
-\centering
-\caption{Comparação dos experimentos seqKAN (L1 e MSE micro)}
-\resizebox{\linewidth}{!}{%
-\begin{tabular}{l r r r}
-\toprule
-Run & L1 (ult. época) & Micro ($\mu \pm \sigma$) & Tempo (min) \\
-\midrule
-GRU Difusão      & - & $0.237 \pm 0.064$ & 10.1\\
-Grid 40 Clamp-6/6 RAdam + AuxSpline (grid12, gate $|x|{-}2$) &  &  & \\
-Grid 40 Clamp-6/6 RAdam + AuxSpline (grid12, gate $|x|{-}2$) & 0.331 & 0.239 ± 0.007 & 11.2\\
-Grid 40 Clamp-6/6 RAdam & 0.390 & $0.269 \pm 0.006$ & 9.3 \\
-Grid 40 Clamp-6/6 Adam  & 0.391 & $0.274 \pm 0.007$ & 8.6\\
-Grid 40 Clamp-10/10 Adam & 0.464 & $0.286 \pm 0.009$ & 9.1 \\
-Grid 20 Clamp-10/10 Adam & 0.499 & $0.300 \pm 0.009$ & 7.9\\
-\bottomrule
-\end{tabular}}
-\end{table}
-
-
-\end{frame}
-
-\begin{frame}{Resultados por Grupo}
-\centering
-
 \begin{table}[H]
 \centering
-\caption{Resultados por grupos}
-\label{tab:seqkan_pergroup_3runs}
+\caption{Comparação dos runs}
 \resizebox{\linewidth}{!}{%
-\begin{tabular}{l c c}
+\begin{tabular}{l r r r r r r r r}
 \toprule
-Run & Grupo 0 ($\mu \pm \sigma$) & Grupo 1 ($\mu \pm \sigma$) \\
+Run 
+& Test Micro Final ($\mu \pm \sigma$) 
+& L1 Final 
+& Tempo (min)\\
 \midrule
-Grid 40 Clamp-6/6 RAdam + AuxSpline (grid12, gate $|x|{-}2$) &    & \\
-Grid 40 Clamp-6/6 RAdam + AuxSpline (grid12, gate $|x|{-}2$)   &  0.208 ± 0.004 &  0.525 ± 0.049 \\
-Grid 40 Clamp-6/6 RAdam  & $0.237 \pm 0.005$ & $\mathbf{0.563 \pm 0.046}$ \\
-Grid 40 Clamp-6/6 Adam   & $\mathbf{0.238 \pm 0.005}$ & $\mathbf{0.606 \pm 0.059}$ \\
-Grid 40 Clamp-10/10 Adam & $0.242 \pm 0.005$      & $0.681 \pm 0.074$ \\
-Grid 20 Clamp-10/10 Adam & $0.257 \pm 0.005$ & $0.683 \pm 0.078$ \\
+Grid 20 Clamp-10/10 Adam 
+& $0.266465 \pm 0.007518$ 
+& 0.414953 
+& 17.22  \\
+Grid 40 Clamp-10/10 Adam
+& $0.252884 \pm 0.007655$
+& 0.393124
+& 13.08\\
+Grid 40 Clamp-6/6 Adam
+& $0.254197 \pm 0.006393$
+& 0.357050
+& 12.91 \\
+Grid 40 Clamp-6/6 RAdam
+& $0.2584 \pm  0.00681$
+& 0.38693
+& 14.68\\
+
+
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\end{frame}
+
+
+
+\begin{frame}{Resultados por Grupos}
+\begin{table}[H]
+\centering
+\caption{Comparação dos resultados Micro por grupo}
+\resizebox{0.9\linewidth}{!}{%
+\begin{tabular}{l r r}
+\toprule
+Run 
+& Grupo 0 ($\mu \pm \sigma$) 
+& Grupo 1 ($\mu \pm \sigma$) \\
+\midrule
+
+Grid 20 Clamp-10/10 Adam 
+& $0.231328 \pm 0.004518$ 
+& $0.584312 \pm 0.062407$ \\
+
+Grid 40 Clamp-10/10 Adam
+& $0.216764 \pm 0.004680$
+& $0.579615 \pm 0.063025$ \\
+
+Grid 40 Clamp-6/6 Adam
+& $0.222590 \pm 0.004638$
+& $0.540104 \pm 0.047264$ \\
+
+Grid 40 Clamp-6/6 RAdam
+& $0.2237 \pm 0.004718$
+& $0.5726  \pm 0.064608$ \\
+
+
 \bottomrule
 \end{tabular}}
 \end{table}
 \end{frame}
 
 
+%
+%\begin{frame}{Resultados - Gráficos por Run}
+%\centering
+%\setlength{\tabcolsep}{2pt}
+%\begin{tabular}{ccc}
+%\includegraphics[width=0.28\linewidth]{../output20-1010.png} &
+%\includegraphics[width=0.28\linewidth]{../output40-1010.png} &
+%\includegraphics[width=0.28\linewidth]{../output40-66.png} \\
+%\tiny Grid 20 Clamp-10/10 Adam &
+%\tiny Grid 40 Clamp-10/10 Adam &
+%\tiny Grid 40 Clamp-6/6 Adam \\
+%\includegraphics[width=0.28\linewidth]{../output40-66Radam.png} &
+%\includegraphics[width=0.28\linewidth]{../output40-66Radamsplineaux.png} & \\
+%\tiny Grid 40 Clamp-6/6 RAdam &
+%\tiny Grid 40 Clamp-6/6 RAdam + AuxSpline &
+% \\
+%\end{tabular}
+%\end{frame}
+%
 
-\begin{frame}{Resultados - Gráficos por Run}
-\centering
-\setlength{\tabcolsep}{2pt}
-\begin{tabular}{ccc}
-\includegraphics[width=0.28\linewidth]{../output20-1010.png} &
-\includegraphics[width=0.28\linewidth]{../output40-1010.png} &
-\includegraphics[width=0.28\linewidth]{../output40-66.png} \\
-\tiny Grid 20 Clamp-10/10 Adam &
-\tiny Grid 40 Clamp-10/10 Adam &
-\tiny Grid 40 Clamp-6/6 Adam \\
-\includegraphics[width=0.28\linewidth]{../output40-66Radam.png} &
-\includegraphics[width=0.28\linewidth]{../output40-66Radamsplineaux.png} & \\
-\tiny Grid 40 Clamp-6/6 RAdam &
-\tiny Grid 40 Clamp-6/6 RAdam + AuxSpline &
- \\
-\end{tabular}
+
+\begin{frame}{Resultados - Fórumlas das Splines}
 \end{frame}
+
 
 \section{Conclusões}
 \begin{frame}{Conclusões}
@@ -304,12 +311,5 @@ Grid 20 Clamp-10/10 Adam & $0.257 \pm 0.005$ & $0.683 \pm 0.078$ \\
 \end{itemize}
 \end{frame}
 
-\begin{frame}{Próximos Passos}
-\begin{itemize}
-\item Comparar com GRU/LSTM/BiLSTM com o mesmo protocolo.
-\item Testar variações de grid e regularização no KAN.
-\item Incluir gráficos de curvas das splines e ablação.
-\end{itemize}
-\end{frame}
 
 \end{document}

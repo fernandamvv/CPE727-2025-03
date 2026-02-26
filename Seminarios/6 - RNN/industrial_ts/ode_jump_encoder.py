@@ -108,13 +108,15 @@ class JumpODEEncoder(nn.Module):
     """
     def __init__(self, in_dim, hidden_dim, mem_len: int = 32,
                  n_heads: int = 4, attn_dropout: float = 0.1,
-                 attn_heads=4, num_layers=2, dropout=0.2, ff_dim=None):
+                 attn_heads=None, num_layers=2, dropout=0.2, ff_dim=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.in_dim = in_dim
         self.mem_len = mem_len
         self.gru = nn.GRUCell(in_dim, in_dim)
         self.odefunc = ODEFunc(in_dim)
+        if attn_heads is None:
+            attn_heads = n_heads
         enc_layer = nn.TransformerEncoderLayer(
             nhead=attn_heads,
             d_model=in_dim,
