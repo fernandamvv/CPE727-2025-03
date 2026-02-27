@@ -96,7 +96,9 @@ class TS_GRU(ODEJump):
         bi_gru: bool = False,
         bi_method: str = 'concat',
         bi_coupled: bool = False,
-        variational_dropout: float = 0.0
+        variational_dropout: float = 0.0,
+        x_min: float | None = None,
+        x_max: float | None = None
         
     ):
         self.lam = lam
@@ -104,6 +106,8 @@ class TS_GRU(ODEJump):
         self.val_loss = float('inf')
         self.model_dim = hidden_dim
         self.in_channels = in_channels
+        self.x_min = x_min
+        self.x_max = x_max
         self.encoder = nn.Sequential(
             nn.Linear(in_channels*2, hidden_dim),
             nn.ReLU(),
@@ -148,9 +152,15 @@ class TS_GRU(ODEJump):
         """
         # Embedding de entrada
         if not already_latent:
-            x = self._clip_x_tensor(x)
+            if self.x_min is not None:
+                x = x.clamp(min=self.x_min)
+            if self.x_max is not None:
+                x = x.clamp(max=self.x_max)
             if x_denoised is not None:
-                x_denoised = self._clip_x_tensor(x_denoised)
+                if self.x_min is not None:
+                    x_denoised = x_denoised.clamp(min=self.x_min)
+                if self.x_max is not None:
+                    x_denoised = x_denoised.clamp(max=self.x_max)
             if x_denoised is not None:
                 # aplique gate (treino=True quando model.training)
                 x_fused, _ = self.denoise_gate(x, x_denoised, mask, train_mode=self.training)
@@ -159,18 +169,23 @@ class TS_GRU(ODEJump):
                 h_in = torch.cat([x, mask], dim=-1)
 
             h = self.encoder(h_in)  # (B,T,hidden_dim)
-        if timestamps is None:
-            raise ValueError("timestamps são obrigatórios para Jump‑ODE Encoder")
         # Static features
         if static_feats is not None and self.static_dim > 0:
             se = self.static_proj(static_feats).unsqueeze(1)  # (b,1,model_dim)
             h = h + se
+        if timestamps is None:
+            raise ValueError("timestamps são obrigatórios para Jump‑ODE Encoder")
+        #tm_e = self.time_encoding(timestamps.to(h.dtype)).to(h.dtype)  # tempo contínuo
+        #h = h + tm_e
         h = self.gru(h)
         state = h
         x_hat = self.decoder(state) if return_x_hat else None
         if x_hat is not None:
-            x_hat = self._clip_x_tensor(x_hat)
-        return x, state, x_hat
+            if self.x_min is not None:
+                x_hat = x_hat.clamp(min=self.x_min)
+            if self.x_max is not None:
+                x_hat = x_hat.clamp(max=self.x_max)
+        return state, x_hat
         
 class GRUEncoder(nn.Module):
     """
@@ -287,7 +302,10 @@ class TSDF_GRU(TSDiffusion):
         log_likelihood: bool = False,
         variational_dropout: float = 0.0,
         use_layernorm: bool = True,
-        sigma_temp: float = 0.7
+        sigma_temp: float = 0.7,
+        x_min: float | None = None,
+        x_max: float | None = None,
+        clamp_in_forward: bool = True,
         ):
         super().__init__(        
             in_channels=in_channels,
@@ -305,6 +323,9 @@ class TSDF_GRU(TSDiffusion):
             nn.ReLU(),
         )
         self.state_dim = hidden_dim if not (bi_gru and bi_method == 'concat') else hidden_dim * 2
+        self.x_min = x_min
+        self.x_max = x_max
+        self.clamp_in_forward = bool(clamp_in_forward)
 
         self.static_dim = static_dim
         if static_dim > 0:
@@ -405,6 +426,7 @@ class TSDF_GRU(TSDiffusion):
         test: bool=True,
         only_gru: bool = False
     ) -> torch.Tensor:
+        only_gru = True
         """
         Args:
             x: (batch, seq_len, in_channels) - dados ruidosos.
@@ -422,6 +444,11 @@ class TSDF_GRU(TSDiffusion):
         vae_tmax_logvar = None
         vae_tmax_logvar_obs = None
         vae_logvar_obs = None
+        if self.clamp_in_forward:
+            if self.x_min is not None:
+                x = x.clamp(min=self.x_min)
+            if self.x_max is not None:
+                x = x.clamp(max=self.x_max)
         t = t if t is not None else torch.randint(0, self.num_steps, (x.size(0),), device=x.device)
         if mask_ts is None and mask is not None:
             mask_ts = mask.any(dim=2, keepdim=True).float()
@@ -468,8 +495,14 @@ class TSDF_GRU(TSDiffusion):
             vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax).clamp(min=-5.0, max=5.0)
 
         x_hat = self.decoder(h) if return_x_hat and self.lam[0]>0 else None
+        if x_hat is not None and self.clamp_in_forward:
+            if self.x_min is not None:
+                x_hat = x_hat.clamp(min=self.x_min)
+            if self.x_max is not None:
+                x_hat = x_hat.clamp(max=self.x_max)
 
         return (
+            x,
             h,
             h,
             ht,

@@ -45,307 +45,250 @@
 \end{frame}
 
 \section{Metodologia}
-\begin{frame}{Metodologia}
-\begin{itemize}
-\item Modelo: seqKAN com m\'ultiplos blocos KAN (kan\_x, kan\_h, kan\_zx, kan\_zz, kan\_out) e parte recorrente.
-\item Parte recorrente: atualiza\c{c}\~ao temporal de estados $h_t$ e $z_t$ (dependem de $t-1$).
-\item Treino supervisionado com reconstrução e sem regularização.
-\item Métricas: MSE e SE (macro e micro).
-\end{itemize}
-\end{frame}
+\begin{frame}{1. Estrutura Geral da Célula}
 
-\begin{frame}{Metodologia: Fórmulas do seqKAN (I)}
-\begin{itemize}
-\item Base B-spline (Cox--de Boor):
-\end{itemize}
-\vspace{-0.5em}
-\[
-\begin{aligned}
-B_{i,0}(x) &= \mathbb{1}_{[t_i,\, t_{i+1})}(x) \\
-B_{i,k}(x) &= \frac{x-t_i}{t_{i+k}-t_i} B_{i,k-1}(x) + \frac{t_{i+k+1}-x}{t_{i+k+1}-t_{i+1}} B_{i+1,k-1}(x)
-\end{aligned}
-\]
-\begin{itemize}
-\item \texttt{coef2curve} (por batch, input e output):
-\end{itemize}
-\vspace{-0.5em}
-\[
- y_{b,i,j} = \sum_{m} B_{b,i,m}(x)\, c_{i,j,m}
-\]
-\end{frame}
+A célula implementa:
 
-\begin{frame}{Metodologia: Fórmulas do seqKAN (II)}
-\begin{itemize}
-\item Sa\'ida da camada (\texttt{KANLayer}):
-\end{itemize}
-\vspace{-0.5em}
 \[
-\hat{y}_{b,j} = \sum_{i} m_{i,j}\, y_{b,i,j}
-\]
-\begin{itemize}
-\item Sa\'ida spline aplicada \`a entrada: $s_1(x_t)=\mathrm{KAN}_x(x_t)$, com
-\end{itemize}
-\vspace{-0.5em}
-\[
- y_{b,i,j} = \sum_{m} B_{b,i,m}(x_t)\, c_{i,j,m}, \qquad
- s_{1,b,j} = \sum_{i} m_{i,j}\, y_{b,i,j}
+h_t = \mathrm{KAN}_{cell}([x_t, h_{t-1}])
 \]
 
-\begin{itemize}
-\item F\'ormula geral da KAN (sa\'ida $j$):
-\end{itemize}
-\vspace{-0.5em}
+onde:
+
 \[
-\mathrm{KAN}_j(x) = \sum_{i} m_{i,j} \sum_{m} c_{i,j,m}\, B_{i,m}(x_i)
+x_t \in \mathbb{R}^{C}, 
+\quad
+h_{t-1} \in \mathbb{R}^{H}
+\]
+
+Entrada concatenada:
+
+\[
+z_t = [x_t, h_{t-1}] \in \mathbb{R}^{C+H}
 \]
 
 \end{frame}
 
+% --------------------------------------------------
+\begin{frame}{2. Forma Funcional por Neurônio}
 
+Para cada neurônio oculto \( j \in \{1,\dots,H\} \):
 
-\begin{frame}{Metodologia: Loss de Reconstru\c{c}\~ao}
-\begin{itemize}
-\item Loss (L1): soma do erro ao quadrado com m\'ascara, normalizada pelo n\'umero de observa\c{c}\~oes.
-\end{itemize}
-\vspace{-0.5em}
 \[
-\mathrm{SSE}_{b,t} = \sum_{d} (x_{b,t,d} - \hat{x}_{b,t,d})^2 \cdot \mathrm{mask}_{b,t,d} \cdot c_{b,t,d}
+h_{t,j} = \sum_{i \in \mathcal{S}_j} s_{ij}(z_{t,i})
 \]
+
+onde:
+
 \[
-\mathrm{nobs}_{b,t} = \sum_{d} \mathrm{mask}_{b,t,d} \cdot c_{b,t,d}
+\mathcal{S}_j \subset \{1,\dots,C+H\}
 \]
+
 \[
-\mathcal{L}_{rec} = \frac{\sum_{b,t} \mathrm{SSE}_{b,t}}{\sum_{b,t} \mathrm{nobs}_{b,t}}
+|\mathcal{S}_j| = k_x + k_h
 \]
+
+Cada \( s_{ij}(\cdot) \) é uma B-spline univariada aprendida.
+
+\end{frame}
+
+% --------------------------------------------------
+\begin{frame}{3. Separação Estrutural Entrada / Estado}
+
+Imposição estrutural:
+
+\[
+\mathcal{S}_j = \mathcal{S}_j^{(x)} \cup \mathcal{S}_j^{(h)}
+\]
+
+com:
+
+\[
+|\mathcal{S}_j^{(x)}| = k_x
+\quad
+|\mathcal{S}_j^{(h)}| = k_h
+\]
+
+Portanto:
+
+\[
+h_{t,j}
+=
+\sum_{i \in \mathcal{S}_j^{(x)}} s_{ij}^{(x)}(x_{t,i})
++
+\sum_{l \in \mathcal{S}_j^{(h)}} s_{lj}^{(h)}(h_{t-1,l})
+\]
+
+\end{frame}
+
+% --------------------------------------------------
+\begin{frame}{4. Forma da Spline por Aresta}
+
+Cada aresta ativa implementa:
+
+\[
+s_{ij}(u)
+=
+\sum_{m=1}^{M} \alpha_{ijm} B_m(u)
+\]
+
+onde:
+
 \begin{itemize}
-\item Observa\c{c}\~oes ausentes n\~ao contribuem (m\'ascara).
+\item \( B_m(u) \): base B-spline de ordem \(k\)
+\item \( \alpha_{ijm} \): coeficientes aprendidos
+\item nós definidos por \texttt{grid} e \texttt{grid\_range}
 \end{itemize}
+
+O neurônio completo:
+
+\[
+h_{t,j}
+=
+\sum_{i \in \mathcal{S}_j}
+\sum_{m=1}^{M}
+\alpha_{ijm} B_m(z_{t,i})
+\]
+
 \end{frame}
 
+% --------------------------------------------------
+\begin{frame}{5. Propriedade Estrutural Importante}
 
+Como as funções são univariadas e somadas:
 
-\begin{frame}{Metodologia: Din\^amica Paralela}
-\begin{equation*}
- h_t = h_{t-1} + m \cdot s_1(x_t) + (1-m) \cdot z_{t-1}
-\end{equation*}
+\[
+\frac{\partial^2 h_{t,j}}
+{\partial z_{t,i} \partial z_{t,r}}
+=
+0
+\quad
+\text{para } i \neq r
+\]
+
+Implica:
+
 \begin{itemize}
-\item $h_t$: estado oculto principal no tempo $t$.
-\item $s_1(x_t)$: sa\'ida spline (seqKAN) aplicada \`a entrada $x_t$.
-\item $z_{t-1}$: estado de uma seqKAN paralela, adiciona uma \textbf{segunda mem\'oria recorrente} (especialmente quando falta dado).
-\item $m$: gate derivado de \texttt{mask}. Se \texttt{mask=None}, $m=1$ (s\'o caminho principal).
-\item Se \texttt{mask} indica falta de dado em $t$, $m$ tende a 0, privilegiando o caminho paralelo.
-\item Se \texttt{mask} n\~ao tem tamanho $H$, o gate vira um \textbf{escalar por amostra} (mesmo $m$ para todos os neur\^onios). Se tem tamanho $H$, o gate \`e um \textbf{vetor por hidden}.
+\item Não há interação cruzada direta entre variáveis dentro do mesmo neurônio.
+\item A interação ocorre apenas via soma no nível do estado.
 \end{itemize}
+
 \end{frame}
 
+% --------------------------------------------------
+\begin{frame}{6. Camada de Saída}
 
+Para cada saída \( y_{t,k} \):
 
-\begin{frame}{Diagrama da Arquitetura}
-\centering
-\small
-\resizebox{\textwidth}{!}{%
-\begin{tikzpicture}[
-  box/.style={draw, rounded corners, align=center, minimum width=22mm, minimum height=8mm, inner sep=2pt},
-  sum/.style={draw, circle, inner sep=1.2pt},
-  arrow/.style={-Latex, shorten >=2pt, shorten <=2pt}
-]
-  % Coordenadas fixas para evitar cruzamentos
-  \node[box] (x)      at (0, 0) {$x_t$};
-  \node[box] (kanx)   at (5.0, 0) {$\mathrm{KAN}_x$};
-  \node[sum] (sumh)   at (7.4, 0) {};
-  \node[box] (h)      at (9.2, 0) {$h_t$};
-  \node[box] (kanout) at (11.6, 0) {$\mathrm{KAN}_{out}$};
-  \node[sum] (sumy)   at (14.0, 0) {};
-  \node[box] (y)      at (16.0, 0) {$y_t$};
+\[
+y_{t,k}
+=
+\sum_{j \in \mathcal{T}_k}
+r_{jk}(h_{t,j})
+\]
 
-  % Linha paralela (z)
-  \node[box] (kanzx)  at (5.0, -2.0) {$\mathrm{KAN}_{zx}(x_t)$};
-  \node[sum] (sumz)   at (7.4, -2.0) {};
-  \node[box] (z)      at (9.2, -2.0) {$z_t$};
-  \node[box] (kanzz)  at (12.8, -2.0) {$\mathrm{KAN}_{zz}(z_{t-1})$};
+com:
 
-  % Máscara (missing) e aux
-  \node[box] (gate)   at (2.4, 0) {$m=\mathbb{1}_{\mathrm{obs}}(x_t)$};
+\[
+|\mathcal{T}_k| = k_{out}
+\]
 
+Cada \( r_{jk} \) também é uma spline univariada.
 
-  % Linha principal (a partir de KANx)
-  \draw[arrow] (kanx) -- (sumh) -- (h) -- (kanout) -- (sumy) -- (y);
-
-  % Linha z (sem cruzar caixas)
-  \draw[arrow] (kanzx) -- (sumz) -- (z);
-  \node[draw, minimum width=7mm, minimum height=4mm, font=\tiny] (zdelay) at (10.8, -2.0) {$z^{-1}$};
-  \draw[arrow] (z) -- (zdelay) -- node[midway, above, yshift=3mm] {\tiny $z_{t-1}$} (kanzz);
-  \draw[arrow] (kanzz.south) |- ([yshift=-4mm]sumz.south) -- (sumz.south);
-  \draw[arrow] (zdelay.north) -- (sumh.south);
-
-  % Máscara de observação (split)
-  \draw[arrow] (x) -- (gate);
-  \draw[arrow] (gate) -- node[midway, above] {\tiny $m$} (kanx.west);
-  \draw[arrow] (gate) -- node[midway, above] {\tiny $1-m$} (kanzx.west);
-
-   % Labels
-  \node[above=2mm of h, xshift=6mm] {\tiny $h_t \leftarrow h_{t-1} + m\,\mathrm{KAN}_x(x_t) + (1-m)\,z_{t-1}$};
-  \node[below=1mm of z] {\tiny $z_t=\mathrm{KAN}_{zx}(x_t)+\mathrm{KAN}_{zz}(z_{t-1})$};
-  \node[above=2mm of y] {\tiny $y_t=\mathrm{KAN}_{out}(h_t)$};
-\end{tikzpicture}
-}
 \end{frame}
 
-\section{Experimentos}
-\begin{frame}{Experimentos}
+% --------------------------------------------------
+% --------------------------------------------------
+\begin{frame}{7. Interpretação como Sistema Dinâmico}
+
+A célula define a recorrência:
+
+\[
+h_t = F(x_t, h_{t-1})
+\]
+
+onde \(F : \mathbb{R}^{C+H} \to \mathbb{R}^H\).
+
+Se \(x_t = 0\), obtemos um sistema autônomo:
+
+\[
+h_t = F(h_{t-1})
+\]
+
+Logo, o SeqKAN define um:
+
+\begin{block}{Sistema Dinâmico Discreto Não Linear}
+\[
+h_{t+1} = F(h_t)
+\]
+\end{block}
+
+Características estruturais:
+
 \begin{itemize}
-\item Dataset: séries temporais industriais (Cognite).
-\item Divisão: janelas temporais com janela fixa e passo fixo.
-\item Avaliação: métricas agregadas e por grupo (classes 0 e 1).
+\item Dinâmica aditiva (não multiplicativa)
+\item Não há matriz de recorrência linear \(W_h\)
+\item A não linearidade está distribuída nas arestas
+\item Interações cruzadas ocorrem apenas via soma no estado
 \end{itemize}
-\end{frame}
-
-\section{Resultados}
-
-
-
-
-\begin{frame}{Resultados Globais}
-\begin{table}[H]
-\centering
-\caption{Comparação dos runs}
-\resizebox{\linewidth}{!}{%
-\begin{tabular}{l r r r r r r r r}
-\toprule
-Run 
-& Test Micro Final ($\mu \pm \sigma$) 
-& L1 Final 
-& Tempo (min)\\
-\midrule
-Grid 20 Clamp-10/10 Adam 
-& $0.266465 \pm 0.007518$ 
-& 0.414953 
-& 17.22  \\
-Grid 40 Clamp-10/10 Adam
-& $0.252884 \pm 0.007655$
-& 0.393124
-& 13.08\\
-Grid 40 Clamp-6/6 Adam
-& $0.254197 \pm 0.006393$
-& 0.357050
-& 12.91 \\
-Grid 40 Clamp-6/6 RAdam
-& $0.2584 \pm  0.00681$
-& 0.38693
-& 14.68\\
-
-
-\bottomrule
-\end{tabular}}
-\end{table}
 
 \end{frame}
 
-\begin{table}[H]
-\centering
-\caption{Comparação dos modelos considerando resultado final de teste}
-\label{tab:final_test_results}
-\resizebox{\linewidth}{!}{
-\begin{tabular}{l r c c c c}
-\toprule
-Modelo
-& L1 (Train Final)
-& Test Micro MSE ($\mu \pm \sigma$)
-& Test Macro MSE ($\mu \pm \sigma$)
-& Grupo 0 ($\mu \pm \sigma$)
-& Grupo 1 ($\mu \pm \sigma$) \\
-\midrule
-TSDF\_GRU
-& 0.235949
-& $0.177969 \pm 0.003852$
-& $0.222494 \pm 0.055592$
-& ---
-& --- \\
+% --------------------------------------------------
+\begin{frame}{8. Forma Matricial com Máscara Estrutural}
 
-TS\_seqKANSeq
-& 0.009126
-& $\mathbf{0.005200 \pm 0.002580}$
-& $\mathbf{0.002945 \pm 0.002802}$
-& ---
-& --- \\
+Representação equivalente:
 
-TSDF\_seqKANseq
-& 0.281832
-& $0.214387 \pm 0.004517$
-& $0.279979 \pm 0.081897$
-& $0.198082 \pm 0.004246$
-& $0.361876 \pm 0.023375$ \\
-\bottomrule
-\end{tabular}}
-\end{table}
+\[
+h_{t,j}
+=
+\sum_{i=1}^{C}
+M_{ij}^{(x)} s_{ij}(x_{t,i})
++
+\sum_{l=1}^{H}
+M_{lj}^{(h)} s_{lj}(h_{t-1,l})
+\]
 
-\begin{frame}{Resultados por Grupos}
-\begin{table}[H]
-\centering
-\caption{Comparação dos resultados Micro por grupo}
-\resizebox{0.9\linewidth}{!}{%
-\begin{tabular}{l r r}
-\toprule
-Run 
-& Grupo 0 ($\mu \pm \sigma$) 
-& Grupo 1 ($\mu \pm \sigma$) \\
-\midrule
+onde:
 
-Grid 20 Clamp-10/10 Adam 
-& $0.231328 \pm 0.004518$ 
-& $0.584312 \pm 0.062407$ \\
-
-Grid 40 Clamp-10/10 Adam
-& $0.216764 \pm 0.004680$
-& $0.579615 \pm 0.063025$ \\
-
-Grid 40 Clamp-6/6 Adam
-& $0.222590 \pm 0.004638$
-& $0.540104 \pm 0.047264$ \\
-
-Grid 40 Clamp-6/6 RAdam
-& $0.2237 \pm 0.004718$
-& $0.5726  \pm 0.064608$ \\
-
-
-\bottomrule
-\end{tabular}}
-\end{table}
-\end{frame}
-
-
-%
-%\begin{frame}{Resultados - Gráficos por Run}
-%\centering
-%\setlength{\tabcolsep}{2pt}
-%\begin{tabular}{ccc}
-%\includegraphics[width=0.28\linewidth]{../output20-1010.png} &
-%\includegraphics[width=0.28\linewidth]{../output40-1010.png} &
-%\includegraphics[width=0.28\linewidth]{../output40-66.png} \\
-%\tiny Grid 20 Clamp-10/10 Adam &
-%\tiny Grid 40 Clamp-10/10 Adam &
-%\tiny Grid 40 Clamp-6/6 Adam \\
-%\includegraphics[width=0.28\linewidth]{../output40-66Radam.png} &
-%\includegraphics[width=0.28\linewidth]{../output40-66Radamsplineaux.png} & \\
-%\tiny Grid 40 Clamp-6/6 RAdam &
-%\tiny Grid 40 Clamp-6/6 RAdam + AuxSpline &
-% \\
-%\end{tabular}
-%\end{frame}
-%
-
-
-\begin{frame}{Resultados - Fórumlas das Splines}
-\end{frame}
-
-
-\section{Conclusões}
-\begin{frame}{Conclusões}
 \begin{itemize}
-\item O seqKAN apresentou desempenho consistente nas métricas globais.
-\item Diferença de erro entre grupos indica desbalanceamento forte, pois a série apresenta poucos casos de falhas.
+\item \(M\) é a máscara estrutural top-k
+\item Cada neurônio possui exatamente \(k_x + k_h\) conexões ativas
 \end{itemize}
+
 \end{frame}
 
+% --------------------------------------------------
+\begin{frame}{9. Implicações Estruturais}
+
+\begin{itemize}
+\item Modelo interpretável (funções explícitas por feature)
+\item Controle estrutural via top-k
+\item Sistema dinâmico não linear esparso
+\item Interação entre variáveis ocorre apenas via estado
+\item Separação clara entre contribuição de \(x_t\) e memória \(h_{t-1}\)
+\end{itemize}
+
+\end{frame}
+
+% --------------------------------------------------
+\begin{frame}{Conclusão}
+
+A célula SeqKAN implementa:
+
+\[
+h_t = F(x_t, h_{t-1})
+\]
+
+com:
+
+\begin{itemize}
+\item Funções univariadas spline
+\item Esparsidade estrutural controlada
+\item Dinâmica recorrente explícita
+\item Alto grau de interpretabilidade
+\end{itemize}
+
+\end{frame}
 
 \end{document}

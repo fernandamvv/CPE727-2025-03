@@ -61,7 +61,16 @@ class SeqKANSeq(nn.Module):
     Supports feature-wise top-k on x, h and output heads.
     """
 
-    def __init__(self, input_size, hidden_size, output_size, kan_params=None, device=None, output_size_rebuild=None):
+    def __init__(
+        self,
+        input_size,
+        hidden_size,
+        output_size,
+        kan_params=None,
+        device=None,
+        output_size_rebuild=None,
+        concat_mask: bool = False,
+    ):
         super().__init__()
         if kan_params is None:
             kan_params = {}
@@ -71,6 +80,7 @@ class SeqKANSeq(nn.Module):
         self.output_size = int(output_size)
         self.output_size_rebuild = int(output_size_rebuild) if output_size_rebuild is not None else None
         self.device = torch.device("cpu") if device is None else torch.device(device)
+        self.concat_mask = bool(concat_mask)
 
         cell_params = kan_params.get("cell", kan_params.get("hidden", {}))
         out_params = kan_params.get("output", {})
@@ -107,42 +117,115 @@ class SeqKANSeq(nn.Module):
         topk_cfg = kan_params.get("topk", {}) if isinstance(kan_params, dict) else {}
         self.topk_enabled = bool(topk_cfg.get("enabled", False))
         self.topk_warmup_epochs = int(topk_cfg.get("warmup_epochs", 0) or 0)
-        self.topk_mode = str(topk_cfg.get("mode", "hard")).lower()
-        self.topk_temp = float(topk_cfg.get("temp", 0.1))
+        self.topk_kind = str(topk_cfg.get("kind", "activation")).lower()
+        self.topk_structural = self.topk_kind in ("structural", "connection", "edge", "edges")
+        self.topk_structural_mode = str(topk_cfg.get("conn_mode", "per_out")).lower()
+        self.topk_structural_score = str(topk_cfg.get("score", "coef_l2")).lower()
         self.topk_kx = topk_cfg.get("k_x", None)
         self.topk_kh = topk_cfg.get("k_h", None)
         self.topk_kout = topk_cfg.get("k_out", None)
+        self.topk_kcell = topk_cfg.get("k_cell", None)
         self.last_topk_ratio = {}
         self.current_epoch = None
+        self._last_structural_epoch = None
 
-    def _apply_topk(self, x, k, name):
-        if not self.topk_enabled:
-            return x
-        if self.current_epoch is None or self.current_epoch <= self.topk_warmup_epochs:
-            return x
+    def _edge_scores(self, layer):
+        if hasattr(layer, "coef") and layer.coef is not None:
+            coef = layer.coef
+            if self.topk_structural_score in ("coef_l1", "coef_abs"):
+                return coef.abs().mean(dim=-1)
+            if self.topk_structural_score in ("coef_l2", "coef_norm"):
+                return torch.sqrt((coef ** 2).mean(dim=-1) + 1e-12)
+        if hasattr(layer, "scale_sp") and layer.scale_sp is not None:
+            return layer.scale_sp.abs()
+        raise ValueError("SeqKANSeq: cannot compute structural topk scores for layer")
+
+    def _apply_structural_topk(self, kan, k, name):
         if k is None:
-            return x
+            return
         k = int(k)
-        if k <= 0 or k >= x.size(-1):
-            return x
-        scores = x.abs()
-        vals, idx = torch.topk(scores, k=k, dim=-1)
-        mask = torch.zeros_like(x, dtype=torch.bool)
-        mask.scatter_(dim=-1, index=idx, value=True)
-        if self.topk_mode == "soft":
-            kth = vals[..., -1, None]
-            gate = torch.sigmoid((scores - kth) / max(self.topk_temp, 1e-6))
-            out = x * gate
-            ratio = gate.mean().detach().item()
+        if k <= 0:
+            return
+        ratios = []
+        for li, layer in enumerate(getattr(kan, "act_fun", [])):
+            base_mask = layer.mask.detach()
+            scores = self._edge_scores(layer).detach()
+            if scores.shape != base_mask.shape:
+                if scores.T.shape == base_mask.shape:
+                    scores = scores.T
+                else:
+                    raise ValueError(
+                        f"SeqKANSeq: structural topk score shape {tuple(scores.shape)} "
+                        f"does not match mask shape {tuple(base_mask.shape)}"
+                    )
+            scores = scores * (base_mask > 0).float()
+            in_dim, out_dim = scores.shape
+            if name == "cell" and self.topk_kx is not None and self.topk_kh is not None:
+                x_rows = self.input_size
+                h_rows = self.hidden_size
+                if in_dim != x_rows + h_rows:
+                    raise ValueError(
+                        f"SeqKANSeq: expected cell in_dim={x_rows + h_rows}, got {in_dim}"
+                    )
+                new_mask = torch.zeros_like(scores)
+                kkx = min(int(self.topk_kx), x_rows)
+                kkh = min(int(self.topk_kh), h_rows)
+                for j in range(out_dim):
+                    col = scores[:, j]
+                    x_col = col[:x_rows]
+                    h_col = col[x_rows:]
+                    if kkx > 0:
+                        _, idx_x = torch.topk(x_col, k=kkx, dim=0)
+                        new_mask[idx_x, j] = 1.0
+                    if kkh > 0:
+                        _, idx_h = torch.topk(h_col, k=kkh, dim=0)
+                        new_mask[x_rows + idx_h, j] = 1.0
+            elif self.topk_structural_mode == "global":
+                total = scores.numel()
+                kk = min(k, total)
+                flat_scores = scores.reshape(-1)
+                _, idx = torch.topk(flat_scores, k=kk, dim=0)
+                new_mask = torch.zeros_like(flat_scores)
+                new_mask.scatter_(0, idx, 1.0)
+                new_mask = new_mask.reshape_as(scores)
+            else:
+                kk = min(k, in_dim)
+                new_mask = torch.zeros_like(scores)
+                for j in range(out_dim):
+                    col = scores[:, j]
+                    if kk >= in_dim:
+                        new_mask[:, j] = (col != 0).float()
+                        continue
+                    _, idx = torch.topk(col, k=kk, dim=0)
+                    new_mask[idx, j] = 1.0
+            layer.mask.data = new_mask * (base_mask > 0).float()
+            ratios.append(float((layer.mask > 0).float().mean().item()))
+        if ratios:
+            self.last_topk_ratio[name] = float(sum(ratios) / len(ratios))
         else:
-            out = torch.where(mask, x, torch.zeros_like(x))
-            ratio = mask.float().mean().detach().item()
-        self.last_topk_ratio[name] = ratio
-        return out
+            self.last_topk_ratio[name] = 0.0
+
+    def _maybe_apply_structural_topk(self):
+        if not self.topk_enabled or not self.topk_structural:
+            return
+        if self.current_epoch is None or self.current_epoch <= self.topk_warmup_epochs:
+            return
+        if self._last_structural_epoch == self.current_epoch:
+            return
+        with torch.no_grad():
+            self._apply_structural_topk(self.kan_cell, self.topk_kcell, "cell")
+            if self.kan_out is not None:
+                for i, head in enumerate(self.kan_out):
+                    self._apply_structural_topk(head, self.topk_kout, f"out{i}")
+            if self.kan_out_rebuild is not None:
+                for i, head in enumerate(self.kan_out_rebuild):
+                    self._apply_structural_topk(head, self.topk_kout, f"rebuild_out{i}")
+        self._last_structural_epoch = self.current_epoch
 
     def forward(self, x, mask=None, return_last=False):
         if next(self.parameters()).device != x.device:
             self.to(x.device)
+        self._maybe_apply_structural_topk()
         B, T, C = x.shape
         if C != self.input_size:
             raise ValueError("SeqKANSeq: input_size mismatch")
@@ -151,23 +234,28 @@ class SeqKANSeq(nn.Module):
         outputs_rebuild = [] if self.kan_out_rebuild is not None else None
         for t in range(T):
             x_t = x[:, t, :]
-            if mask is not None:
-                x_t = x_t * mask[:, t, :]
-            x_t = self._apply_topk(x_t, self.topk_kx, "x")
-            h_prev = self._apply_topk(h, self.topk_kh, "h")
-            h_in = torch.cat([x_t, h_prev], dim=-1)
+            if self.concat_mask:
+                if mask is None:
+                    m_t = torch.ones_like(x_t)
+                else:
+                    m_t = mask[:, t, :]
+                x_in = torch.cat([x_t, m_t], dim=-1)
+            else:
+                if mask is not None:
+                    x_t = x_t * mask[:, t, :]
+                x_in = x_t
+            h_prev = h
+            h_in = torch.cat([x_in, h_prev], dim=-1)
             h = self.kan_cell(h_in)
             y_list = []
             for i, head in enumerate(self.kan_out):
-                h_out = self._apply_topk(h, self.topk_kout, f"out{i}")
-                y_list.append(head(h_out))
+                y_list.append(head(h))
             y_t = torch.cat(y_list, dim=-1)
             outputs.append(y_t)
             if self.kan_out_rebuild is not None:
                 y_list_r = []
                 for i, head in enumerate(self.kan_out_rebuild):
-                    h_out = self._apply_topk(h, self.topk_kout, f"rebuild_out{i}")
-                    y_list_r.append(head(h_out))
+                    y_list_r.append(head(h))
                 y_t_r = torch.cat(y_list_r, dim=-1)
                 outputs_rebuild.append(y_t_r)
         outputs = torch.stack(outputs, dim=1)
@@ -203,25 +291,35 @@ class SeqKANCore(nn.Module):
         mask = F.dropout(mask, p=self.variational_dropout, training=True)
         return x * mask.unsqueeze(1)
 
-    def forward(self, x, mask=None, return_last=False):
+    def forward(self, x, return_last=False):
         x = self._apply_variational_dropout(x)
-        return self.seqkan(x, mask=mask, return_last=return_last)
+        return self.seqkan(x, mask=None, return_last=return_last)
 
 
 class SeqKANEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim, kan_params=None, variational_dropout=0.0, use_layernorm: bool = True):
+    def __init__(
+        self,
+        in_dim,
+        hidden_dim,
+        kan_params=None,
+        variational_dropout=0.0,
+        use_layernorm: bool = True,
+        mask_as_input: bool = False,
+    ):
         super().__init__()
         self.in_dim = int(in_dim)
         self.hidden_dim = int(hidden_dim)
         self.variational_dropout = float(max(0.0, variational_dropout))
         self.use_layernorm = use_layernorm
+        self.mask_as_input = bool(mask_as_input)
+        in_dim_eff = self.in_dim * 2 if self.mask_as_input else self.in_dim
         self.seqkan = SeqKANSeq(
-            input_size=self.in_dim,
+            input_size=in_dim_eff,
             hidden_size=self.hidden_dim,
             output_size=self.hidden_dim,
             kan_params=kan_params,
         )
-        self.norm_x = nn.LayerNorm(self.in_dim) if use_layernorm else None
+        self.norm_x = nn.LayerNorm(in_dim_eff) if use_layernorm else None
         self.norm_H = nn.LayerNorm(self.hidden_dim) if use_layernorm else None
         self.encoder = None
 
@@ -235,111 +333,17 @@ class SeqKANEncoder(nn.Module):
 
     def forward(self, x, ts=None, only_gru=False, mask=None):  # noqa: ARG002
         x = self._apply_variational_dropout(x)
+        if self.mask_as_input:
+            if mask is None:
+                mask = torch.ones_like(x)
+            x = torch.cat([x, mask], dim=-1)
         if self.norm_x is not None:
             x = self.norm_x(x)
-        outputs = self.seqkan(x, mask=mask, return_last=False)
+        outputs = self.seqkan(x, mask=None, return_last=False)
         if self.norm_H is not None:
             outputs = self.norm_H(outputs)
         return outputs
 
-
-class TS_seqKANSeq(ODEJump):
-    """
-    SeqKANSeq com o mesmo pipeline/loss do TS_GRU (ODEJump).
-    Apenas o backbone recursivo muda (GRU -> SeqKANSeq).
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_dim: int = 256,
-        static_dim: int = 0,
-        denoised: bool = False,
-        lam: list[float, float] | None = None,
-        cost_columns: list | None = None,
-        kan_params: dict | None = None,
-    ):
-        if lam is None:
-            lam = [0.9, 0.1, 0.0, 0.0]
-        # garante tamanho minimo para compatibilidade com ODEJump
-        if len(lam) < 4:
-            lam = list(lam) + [0.0] * (4 - len(lam))
-        self.lam = lam
-        super().__init__(in_channels, hidden_dim, static_dim, denoised, lam, cost_columns)
-        self.val_loss = float("inf")
-        self.model_dim = hidden_dim
-        self.in_channels = in_channels
-        self.static_dim = static_dim
-        if kan_params is None:
-            kan_params = {}
-
-        self.encoder = nn.Sequential(
-            nn.Linear(in_channels * 2, hidden_dim),
-            nn.ReLU(),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, in_channels),
-        )
-        if static_dim > 0:
-            self.static_proj = nn.Sequential(
-                nn.Linear(static_dim, hidden_dim),
-                nn.ReLU(),
-            )
-
-        # Backbone seqKANseq no espaço latente
-        self.seq = SeqKANSeq(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            output_size=hidden_dim,
-            kan_params=kan_params,
-            device=None,
-        )
-        # (d) m_b  — probabilidade de observação (Bernoulli) para L4
-        self.miss_head = nn.Linear(hidden_dim, 1)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        timestamps: torch.Tensor = None,
-        static_feats: torch.Tensor = None,
-        already_latent: bool = False,
-        return_x_hat: bool = False,
-        mask = None,
-        x_denoised: torch.Tensor = None
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, in_channels) - dados ruidosos.
-            t: (batch,) - passos de difusão.
-            timestamps: (batch, seq_len) - colunas de tempo.
-            static_feats: (batch, static_dim).
-        """
-        # Embedding de entrada
-        if not already_latent:
-            x = self._clip_x_tensor(x)
-            if x_denoised is not None:
-                x_denoised = self._clip_x_tensor(x_denoised)
-            if x_denoised is not None:
-                # aplique gate (treino=True quando model.training)
-                x_fused, _ = self.denoise_gate(x, x_denoised, mask, train_mode=self.training)
-                h_in = torch.cat([x_fused, mask], dim=-1)
-            else:
-                h_in = torch.cat([x, mask], dim=-1)
-
-            h = self.encoder(h_in)  # (B,T,hidden_dim)
-        if timestamps is None:
-            raise ValueError("timestamps são obrigatórios para Jump‑ODE Encoder")
-        # Static features
-        if static_feats is not None and self.static_dim > 0:
-            se = self.static_proj(static_feats).unsqueeze(1)  # (b,1,model_dim)
-            h = h + se
-        h = self.seq(h)
-        state = h
-        x_hat = self.decoder(state) if return_x_hat else None
-        if x_hat is not None:
-            x_hat = self._clip_x_tensor(x_hat)
-        return x, state, x_hat
 
 
 class TSDF_seqKANSeq(TSDiffusion):
@@ -364,7 +368,9 @@ class TSDF_seqKANSeq(TSDiffusion):
         sigma_temp: float = 0.7,
         kan_params: dict | None = None,
         direct_x: bool = True,
-        feature_scale: bool = False,
+        x_min: float | None = None,
+        x_max: float | None = None,
+        clamp_in_forward: bool = True,
     ):
         if bi_gru:
             raise ValueError("seqKAN core does not support bi_gru.")
@@ -380,9 +386,9 @@ class TSDF_seqKANSeq(TSDiffusion):
             sigma_temp=sigma_temp,
         )
         self.direct_x = bool(direct_x)
-        self.feature_scale = bool(feature_scale)
-        if self.feature_scale:
-            self.feature_scale_log = nn.Parameter(torch.zeros(in_channels))
+        self.x_min = x_min
+        self.x_max = x_max
+        self.clamp_in_forward = bool(clamp_in_forward)
         self._warned_mask_none = False
         if not self.direct_x:
             self.encoder = nn.Sequential(
@@ -392,12 +398,12 @@ class TSDF_seqKANSeq(TSDiffusion):
             self.state_dim = hidden_dim
         else:
             self.encoder = None
-            self.state_dim = in_channels
+            self.state_dim = in_channels * 2
 
         self.static_dim = static_dim
         if static_dim > 0:
             self.static_proj = nn.Sequential(
-                nn.Linear(static_dim, in_channels if self.direct_x else hidden_dim),
+                nn.Linear(static_dim, self.state_dim),
                 nn.ReLU(),
             )
 
@@ -495,13 +501,14 @@ class TSDF_seqKANSeq(TSDiffusion):
         vae_tmax_logvar = None
         vae_tmax_logvar_obs = None
         vae_logvar_obs = None
-        x = self._clip_x_tensor(x)
+        if self.clamp_in_forward:
+            if self.x_min is not None:
+                x = x.clamp(min=self.x_min)
+            if self.x_max is not None:
+                x = x.clamp(max=self.x_max)
         t = t if t is not None else torch.randint(0, self.num_steps, (x.size(0),), device=x.device)
         if mask_ts is None and mask is not None:
             mask_ts = mask.any(dim=2, keepdim=True).float()
-        if self.feature_scale and not already_latent:
-            scale = self.feature_scale_log.exp().view(1, 1, -1)
-            x = x * scale
         if self.direct_x and mask is None:
             if not self._warned_mask_none:
                 warnings.warn(
@@ -514,7 +521,7 @@ class TSDF_seqKANSeq(TSDiffusion):
             mask_ts = mask.any(dim=2, keepdim=True).float()
         if not already_latent:
             if self.direct_x:
-                h = x
+                h = torch.cat([x, mask], dim=-1)
             else:
                 h = self.encoder(torch.cat([x, mask], dim=-1))
             if not test and self.lam[1] > 0:
@@ -529,10 +536,17 @@ class TSDF_seqKANSeq(TSDiffusion):
         if static_feats is not None and self.static_dim > 0:
             se = self.static_proj(static_feats).unsqueeze(1)
             h = h + se
+        mask_seqkan = None
+        if not self.direct_x:
+            if mask is not None:
+                if mask.shape[-1] == h.shape[-1]:
+                    mask_seqkan = mask
+                elif h.shape[-1] == mask.shape[-1] * 2:
+                    mask_seqkan = torch.cat([mask, mask], dim=-1)
         if self.lam[0] > 0 or self.lam[4] > 0:
-            h = self.encoder_ode_x(h, mask=mask)
+            h = self.encoder_ode_x(h, mask=mask_seqkan)
         if self.lam[2] > 0 or self.lam[5] > 0:
-            ht = self.encoder_ode_tmax(h, mask=mask)
+            ht = self.encoder_ode_tmax(h, mask=mask_seqkan)
             tmax_hat = self.tmax_head(ht)
         else:
             ht = None
@@ -556,8 +570,11 @@ class TSDF_seqKANSeq(TSDiffusion):
             vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax).clamp(min=-5.0, max=5.0)
 
         x_hat = self.decoder(h) if return_x_hat and self.lam[0] > 0 else None
-        if x_hat is not None:
-            x_hat = self._clip_x_tensor(x_hat)
+        if x_hat is not None and self.clamp_in_forward:
+            if self.x_min is not None:
+                x_hat = x_hat.clamp(min=self.x_min)
+            if self.x_max is not None:
+                x_hat = x_hat.clamp(max=self.x_max)
 
         return (
             x,

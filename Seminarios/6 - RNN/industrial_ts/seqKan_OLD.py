@@ -323,19 +323,29 @@ class SeqKANCore(nn.Module):
 
 
 class SeqKANEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim, kan_params=None, variational_dropout=0.0, use_layernorm: bool = True):
+    def __init__(
+        self,
+        in_dim,
+        hidden_dim,
+        kan_params=None,
+        variational_dropout=0.0,
+        use_layernorm: bool = True,
+        mask_as_input: bool = False,
+    ):
         super().__init__()
         self.in_dim = int(in_dim)
         self.hidden_dim = int(hidden_dim)
         self.variational_dropout = float(max(0.0, variational_dropout))
         self.use_layernorm = use_layernorm
+        self.mask_as_input = bool(mask_as_input)
+        in_dim_eff = self.in_dim * 2 if self.mask_as_input else self.in_dim
         self.seqkan = SeqKAN(
-            input_size=self.in_dim,
+            input_size=in_dim_eff,
             hidden_size=self.hidden_dim,
             output_size=self.hidden_dim,
             kan_params=kan_params,
         )
-        self.norm_x = nn.LayerNorm(self.in_dim) if use_layernorm else None
+        self.norm_x = nn.LayerNorm(in_dim_eff) if use_layernorm else None
         self.norm_H = nn.LayerNorm(self.hidden_dim) if use_layernorm else None
         self.encoder = None
 
@@ -349,6 +359,10 @@ class SeqKANEncoder(nn.Module):
 
     def forward(self, x, ts=None, only_gru=False, mask=None):  # noqa: ARG002
         x = self._apply_variational_dropout(x)
+        if self.mask_as_input:
+            if mask is None:
+                mask = torch.ones_like(x)
+            x = torch.cat([x, mask], dim=-1)
         if self.norm_x is not None:
             x = self.norm_x(x)
         outputs = self.seqkan(x, mask=mask, return_last=False)
@@ -1124,6 +1138,7 @@ class TSDF_seqKAN(TSDiffusion):
                 kan_params=kan_params,
                 variational_dropout=variational_dropout,
                 use_layernorm=use_layernorm,
+                mask_as_input=True,
             )
             if self.log_likelihood:
                 self.lambda_tmax_head = nn.Sequential(
@@ -1140,6 +1155,7 @@ class TSDF_seqKAN(TSDiffusion):
                 kan_params=kan_params,
                 variational_dropout=variational_dropout,
                 use_layernorm=use_layernorm,
+                mask_as_input=True,
             )
             self.decoder = nn.Sequential(
                 nn.Linear(self.state_dim, hidden_dim // 2),
