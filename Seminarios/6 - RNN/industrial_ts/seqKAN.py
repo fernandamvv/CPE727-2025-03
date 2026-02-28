@@ -233,7 +233,7 @@ class SeqKANSeq(nn.Module):
                 self._apply_structural_topk(self.kan_out, self.topk_kout, "out")
         self._last_structural_epoch = self.current_epoch
 
-    def forward(self, x, mask=None, return_last=False):
+    def forward(self, x, return_last=False):
         if next(self.parameters()).device != x.device:
             self.to(x.device)
         self._maybe_apply_structural_topk()
@@ -244,31 +244,8 @@ class SeqKANSeq(nn.Module):
         outputs = []
         for t in range(T):
             x_t = x[:, t, :]
-            if self.concat_mask:
-                if mask is None:
-                    m_t = torch.ones_like(x_t)
-                else:
-                    m_t = mask[:, t, :]
-                x_in = torch.cat([x_t, m_t], dim=-1)
-            else:
-                if mask is not None:
-                    if x_t.shape[-1] == mask.shape[-1]:
-                        x_t = x_t * mask[:, t, :]
-                    else:
-                        m_t = mask[:, t, :]
-                        # assume x_t = [x, mask]; apply mask only on x part
-                        if x_t.shape[-1] == m_t.shape[-1] * 2:
-                            x_feat = x_t[:, : m_t.shape[-1]]
-                            x_mask = x_t[:, m_t.shape[-1] :]
-                            x_feat = x_feat * m_t
-                            x_t = torch.cat([x_feat, x_mask], dim=-1)
-                        else:
-                            raise ValueError(
-                                f"SeqKANSeq: mask shape mismatch. x_t={tuple(x_t.shape)}, mask_t={tuple(m_t.shape)}"
-                            )
-                x_in = x_t
             h_prev = h
-            h_in = torch.cat([x_in, h_prev], dim=-1)
+            h_in = torch.cat([x_t, h_prev], dim=-1)
             h = self.kan_cell(h_in)
             y_t = self.kan_out(h)
             outputs.append(y_t)
@@ -418,7 +395,7 @@ class TSDF_seqKANSeq(TSDiffusion):
         self.static_dim = 0
         if self.lam[0] > 0.0 or self.lam[4] > 0.0:
             # Reconstrução direta via KAN out (sem kan_out_rebuild e sem MLP decoder)
-            self.encoder_ode_x = SeqKANSeq(
+            self.seqKAN = SeqKANSeq(
                 input_size=self.state_dim,
                 hidden_size=hidden_dim,
                 output_size=in_channels,
@@ -468,10 +445,7 @@ class TSDF_seqKANSeq(TSDiffusion):
         if mask_ts is None:
             mask_ts = mask.any(dim=2, keepdim=True).float()
         if not already_latent:
-            if self.direct_x:
-                h = torch.cat([x, mask], dim=-1)
-            else:
-                h = self.encoder(torch.cat([x, mask], dim=-1))
+            h = torch.cat([x, mask], dim=-1)
             if not test and self.lam[1] > 0:
                 if self.noise_on_mask:
                     noise = torch.randn_like(h)
@@ -488,10 +462,9 @@ class TSDF_seqKANSeq(TSDiffusion):
                 t = torch.zeros((x.size(0),), device=x.device, dtype=torch.long)
                 noise = None
         else:
-            h = x
-        mask_seqkan = None
+            h = torch.cat([x, mask], dim=-1)
         if self.lam[0] > 0 or self.lam[4] > 0:
-            outputs, h = self.encoder_ode_x(h, mask=mask_seqkan, return_last=True)
+            outputs, h = self.seqKAN(h, return_last=True)
         ht = None
         tmax_hat = None
 
