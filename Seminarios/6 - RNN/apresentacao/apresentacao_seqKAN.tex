@@ -36,91 +36,156 @@
 \end{frame}
 
 \section{Resumo}
+
 \begin{frame}{Resumo}
+
 \begin{itemize}
-\item Objetivo: avaliar o modelo seqKAN para reconstrução de séries temporais industriais buscando maior interpretação.
-\item seqKAN: modelo baseado em splines B-spline para modelar relações não lineares e temporais.
-\item Metodologia: treino supervisionado com loss de reconstrução, usando métricas MSE e SE.
+\item Backbone: \textbf{SeqKANSeq} inserido no framework \textbf{TSDiffusion}.
+\item Dinâmica recorrente modelada por KAN com splines univariadas.
+\item Função de perda multi-termo $\mathcal{L} = \sum_i \lambda_i \mathcal{L}_i$.
+\item Nos experimentos: termo de reconstrução (MSE) ativo.
+\item Métrica reportada: MSE (média $\pm$ erro padrão).
 \end{itemize}
+
 \end{frame}
 
 \section{Metodologia}
 \begin{frame}{1. Estrutura Geral da Célula}
 
-A célula implementa:
+A célula implementa, no caso padrão (\texttt{concat\_mask=False}):
+
 
 \[
-h_t = \mathrm{KAN}_{cell}([x_t, h_{t-1}])
-\]
-
-onde:
-
-\[
-x_t \in \mathbb{R}^{C}, 
+h_t = \mathrm{KAN}_{cell}\big([x_t, h_{t-1}]\big),
 \quad
-h_{t-1} \in \mathbb{R}^{H}
+x_t \in \mathbb{R}^{C}, \; h_{t-1} \in \mathbb{R}^{H}
 \]
 
-Entrada concatenada:
+\medskip
+\textbf{Tratamento de máscara no código:}
 
+\begin{itemize}
+\item Se \texttt{mask} é fornecida e \texttt{concat\_mask=False}, o código faz \textbf{gating multiplicativo} na entrada:
 \[
-z_t = [x_t, h_{t-1}] \in \mathbb{R}^{C+H}
+x_t \leftarrow x_t \odot m_t
+\]
+onde \(m_t\) é a máscara no tempo \(t\).
+
+\item Se \texttt{concat\_mask=True}, a máscara entra como \textbf{feature extra}:
+\[
+x^{in}_t = [x_t, m_t] \in \mathbb{R}^{2C}
+\]
+
+e a recorrência passa a ser:
+\[
+h_t = \mathrm{KAN}_{cell}\big([x_t, m_t, h_{t-1}]\big)
+= \mathrm{KAN}_{cell}\big([x^{in}_t, h_{t-1}]\big)
+\]
+\end{itemize}
+
+\medskip
+Entrada concatenada geral:
+\[
+z_t = [x^{in}_t, h_{t-1}] \in \mathbb{R}^{C_{in}+H},
+\quad
+C_{in}=
+\begin{cases}
+C, & \text{se } \texttt{concat\_mask=False}\\
+2C, & \text{se } \texttt{concat\_mask=True}
+\end{cases}
 \]
 
 \end{frame}
 
 % --------------------------------------------------
-\begin{frame}{2. Forma Funcional por Neurônio}
+% --------------------------------------------------
+\begin{frame}{2. Seleção Estrutural Top-k (Condicional)}
 
-Para cada neurônio oculto \( j \in \{1,\dots,H\} \):
+A esparsidade estrutural é aplicada apenas se:
+
+\begin{itemize}
+\item \texttt{topk.enabled = True}
+\item \texttt{topk.kind = structural}
+\item \texttt{epoch > warmup\_epochs}
+\end{itemize}
+
+\medskip
+
+A máscara é construída a partir de um \textbf{score estrutural} por aresta:
 
 \[
-h_{t,j} = \sum_{i \in \mathcal{S}_j} s_{ij}(z_{t,i})
+\text{score}_{ij}
+=
+\begin{cases}
+\|\alpha_{ij\cdot}\|_1 \\
+\|\alpha_{ij\cdot}\|_2
+\end{cases}
 \]
 
-onde:
+onde \( \alpha_{ij\cdot} \) são os coeficientes da spline na aresta \(i \to j\).
+
+\medskip
+
+A nova máscara seleciona as maiores conexões segundo o score,
+\textbf{respeitando a máscara base do ArticleKAN}:
 
 \[
-\mathcal{S}_j \subset \{1,\dots,C+H\}
+M^{new}_{ij}
+=
+\mathbf{1}_{\text{top-k}} \cdot
+\mathbf{1}_{M^{base}_{ij} > 0}
 \]
-
-\[
-|\mathcal{S}_j| = k_x + k_h
-\]
-
-Cada \( s_{ij}(\cdot) \) é uma B-spline univariada aprendida.
 
 \end{frame}
 
 % --------------------------------------------------
-\begin{frame}{3. Separação Estrutural Entrada / Estado}
+\begin{frame}{3. Separação Estrutural Entrada / Estado (Célula)}
 
-Imposição estrutural:
+No caso da célula recorrente, se definidos:
 
 \[
-\mathcal{S}_j = \mathcal{S}_j^{(x)} \cup \mathcal{S}_j^{(h)}
+k_x = \texttt{topk.k\_x},
+\quad
+k_h = \texttt{topk.k\_h}
+\]
+
+a seleção é feita separadamente:
+
+\medskip
+
+\[
+h_{t,j}
+=
+\sum_{i \in \mathcal{S}_j^{(x)}} s_{ij}(x_{t,i})
++
+\sum_{l \in \mathcal{S}_j^{(h)}} s_{lj}(h_{t-1,l})
 \]
 
 com:
 
 \[
-|\mathcal{S}_j^{(x)}| = k_x
-\quad
-|\mathcal{S}_j^{(h)}| = k_h
+|\mathcal{S}_j^{(x)}| \le k_x,
+\qquad
+|\mathcal{S}_j^{(h)}| \le k_h
 \]
 
-Portanto:
+\medskip
 
-\[
-h_{t,j}
-=
-\sum_{i \in \mathcal{S}_j^{(x)}} s_{ij}^{(x)}(x_{t,i})
-+
-\sum_{l \in \mathcal{S}_j^{(h)}} s_{lj}^{(h)}(h_{t-1,l})
-\]
+Implementação no código:
+
+\begin{itemize}
+\item Primeiras \texttt{input\_size} linhas $\Rightarrow$ entradas
+\item Próximas \texttt{hidden\_size} linhas $\Rightarrow$ estado
+\item Seleção top-$k_x$ e top-$k_h$ feita por coluna (por neurônio oculto)
+\end{itemize}
+
+\medskip
+
+Obs.: O número efetivo pode ser menor caso a máscara base já restrinja conexões.
 
 \end{frame}
 
+% --------------------------------------------------
 % --------------------------------------------------
 \begin{frame}{4. Forma da Spline por Aresta}
 
@@ -138,7 +203,10 @@ onde:
 \item \( B_m(u) \): base B-spline de ordem \(k\)
 \item \( \alpha_{ijm} \): coeficientes aprendidos
 \item nós definidos por \texttt{grid} e \texttt{grid\_range}
+\item \texttt{grid\_eps}: controla mistura entre grid uniforme e adaptativo
 \end{itemize}
+
+\medskip
 
 O neurônio completo:
 
@@ -153,47 +221,65 @@ h_{t,j}
 \end{frame}
 
 % --------------------------------------------------
-\begin{frame}{5. Propriedade Estrutural Importante}
+\begin{frame}{5. Propriedade Estrutural}
 
-Como as funções são univariadas e somadas:
+Para cada neurônio:
+
+\[
+h_{t,j} = \sum_i s_{ij}(z_{t,i})
+\]
+
+Logo,
 
 \[
 \frac{\partial^2 h_{t,j}}
-{\partial z_{t,i} \partial z_{t,r}}
-=
-0
-\quad
-\text{para } i \neq r
+{\partial z_{t,i} \partial z_{t,r}} = 0
+\quad (i \neq r)
 \]
 
-Implica:
-
 \begin{itemize}
-\item Não há interação cruzada direta entre variáveis dentro do mesmo neurônio.
-\item A interação ocorre apenas via soma no nível do estado.
+\item Sem interações cruzadas diretas por aresta
+\item Estrutura aditiva e interpretável
 \end{itemize}
 
 \end{frame}
 
+
 % --------------------------------------------------
 \begin{frame}{6. Camada de Saída}
 
-Para cada saída \( y_{t,k} \):
+Para cada saída $k$, o modelo usa uma head KAN:
+
+\[
+\mathrm{KAN}^{(k)}_{\text{out}} : \mathbb{R}^{H} \rightarrow \mathbb{R}
+\quad (\text{width} = [H,1])
+\]
+
+Logo:
+
+\[
+y_{t,k} = \mathrm{KAN}^{(k)}_{\text{out}}(h_t)
+\]
+
+\medskip
+
+Forma estrutural:
 
 \[
 y_{t,k}
 =
-\sum_{j \in \mathcal{T}_k}
-r_{jk}(h_{t,j})
+\sum_{j=1}^{H}
+M^{(k)}_{j}\; r^{(k)}_{j}(h_{t,j})
 \]
 
-com:
+\medskip
 
+Se \texttt{topk.kind=structural}, aplica-se seleção
 \[
-|\mathcal{T}_k| = k_{out}
+| \{ j : M^{(k)}_{j}=1 \} | \le k_{out}
 \]
 
-Cada \( r_{jk} \) também é uma spline univariada.
+(após \texttt{warmup}, respeitando a máscara base).
 
 \end{frame}
 
@@ -207,7 +293,7 @@ A célula define a recorrência:
 h_t = F(x_t, h_{t-1})
 \]
 
-onde \(F : \mathbb{R}^{C+H} \to \mathbb{R}^H\).
+onde $F : \mathbb{R}^{C_{in}+H} \to \mathbb{R}^H$.
 
 Se \(x_t = 0\), obtemos um sistema autônomo:
 
@@ -234,15 +320,16 @@ Características estruturais:
 
 \end{frame}
 
-% --------------------------------------------------
-\begin{frame}{8. Forma Matricial com Máscara Estrutural}
 
-Representação equivalente:
+% --------------------------------------------------
+\begin{frame}{8. Forma Matricial com Máscara Estrutural Dinâmica}
+
+Representação com máscara dependente da época:
 
 \[
 h_{t,j}
 =
-\sum_{i=1}^{C}
+\sum_{i=1}^{C_{in}}
 M_{ij}^{(x)} s_{ij}(x_{t,i})
 +
 \sum_{l=1}^{H}
@@ -252,9 +339,19 @@ M_{lj}^{(h)} s_{lj}(h_{t-1,l})
 onde:
 
 \begin{itemize}
-\item \(M\) é a máscara estrutural top-k
-\item Cada neurônio possui exatamente \(k_x + k_h\) conexões ativas
+\item $M$ é atualizada dinamicamente após \texttt{warmup}
+\item A seleção pode ser:
+\begin{itemize}
+\item \textbf{per-output}: top-k por coluna
+\item \textbf{global}: top-k global na camada
 \end{itemize}
+\item Na célula: possível separação explícita entre $k_x$ e $k_h$
+\end{itemize}
+
+\medskip
+
+A máscara estrutural não altera os coeficientes,
+apenas zera conexões fora do top-k.
 
 \end{frame}
 
@@ -262,19 +359,130 @@ onde:
 \begin{frame}{9. Implicações Estruturais}
 
 \begin{itemize}
-\item Modelo interpretável (funções explícitas por feature)
-\item Controle estrutural via top-k
-\item Sistema dinâmico não linear esparso
-\item Interação entre variáveis ocorre apenas via estado
-\item Separação clara entre contribuição de \(x_t\) e memória \(h_{t-1}\)
+\item Funções explícitas por feature (splines univariadas por aresta)
+\item Controle estrutural via top-k (opcional)
+\item Sistema dinâmico não linear com esparsidade estrutural
+\item Ausência de interação cruzada direta dentro da aresta KAN
+\item Separação explícita entre contribuição de $x_t$ e memória $h_{t-1}$
 \end{itemize}
 
 \end{frame}
 
+
+\section{Resultados}
+
+% --------------------------------------------------
+\begin{frame}{Comparação Final -- Test Results}
+\centering
+\small
+
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l c c}
+\toprule
+Modelo 
+& Loss (train) 
+& Teste MSE ($\mu \pm \mathrm{SE}$)  \\
+\midrule
+TSDF\_GRU  (hidden 11 * 32)
+& 0.220276
+& 0.178609 $\pm$ 0.003885  \\
+
+TSDF\_GRU  (hidden 24)
+& 0.255656
+& 0.198943  $\pm$ 0.004269 \\
+
+TSDF\_SeqKANSeq (grid 8/hidden 24/k\_x 6 k\_h 6 k\_out 8)
+& 0.257547
+& 0.200799 $\pm$ 0.004295 \\  
+
+
+TSDF\_SeqKANSeq (grid 8/hidden 64/k\_x 6 k\_h 15 k\_out 20)
+& 
+&  $\pm$  \\  
+
+TSDF\_SeqKANSeq 
+&
+&   $\pm$  \\  
+
+TSDF\_SeqKANSeq 
+&
+&   $\pm$  \\  
+
+TSDF\_SeqKANSeq 
+&
+&   $\pm$  \\  
+TSDF\_SeqKANSeq 
+& 
+&   $\pm$  \\  
+
+
+\bottomrule
+\end{tabular}
+}
+
+\end{frame}
+
+
+
+\begin{frame}{Comparação Final por Grupos -- Test Results}
+\centering
+\small
+
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l c c}
+\toprule
+Modelo 
+& MSE Grupo 0 ($\mu \pm \mathrm{SE}$) 
+& Grupo 1 ($\mu \pm \mathrm{SE}$) \\
+\midrule
+TSDF\_GRU   (hidden 11 * 32)
+& 0.168903 $\pm$ 0.003818 
+& 0.266408 $\pm$ 0.017820 \\
+
+TSDF\_GRU  (hidden 24)
+& 0.185448 $\pm$  0.004092
+& 0.321018 $\pm$ 0.021071 \\
+
+TSDF\_SeqKANSeq (grid 8/hidden 24/k\_x 6 k\_h 6 k\_out 8)
+& 0.187149 $\pm$ 0.004091 
+& 0.324272  $\pm$ 0.021596 \\
+
+TSDF\_SeqKANSeq (grid 8/hidden 64/k\_x 6 k\_h 15 k\_out 20)
+& $\pm$  
+&  $\pm$  \\  
+
+TSDF\_SeqKANSeq 
+&   $\pm$
+&   $\pm$  \\  
+
+TSDF\_SeqKANSeq 
+&   $\pm$ 
+&   $\pm$  \\  
+
+TSDF\_SeqKANSeq
+&     $\pm$ 
+&   $\pm$  \\  
+
+TSDF\_SeqKANSeq 
+&    $\pm$ 
+&   $\pm$  \\  
+
+
+
+\bottomrule
+\end{tabular}
+}
+
+\end{frame}
+
+
+
+
+
 % --------------------------------------------------
 \begin{frame}{Conclusão}
 
-A célula SeqKAN implementa:
+SeqKANSeq implementa:
 
 \[
 h_t = F(x_t, h_{t-1})
@@ -283,12 +491,16 @@ h_t = F(x_t, h_{t-1})
 com:
 
 \begin{itemize}
-\item Funções univariadas spline
-\item Esparsidade estrutural controlada
-\item Dinâmica recorrente explícita
-\item Alto grau de interpretabilidade
+\item Não linearidade distribuída nas arestas (B-splines)
+\item Recorrência explícita sem gates multiplicativos
+\item Esparsidade estrutural opcional via top-k
+\item Estrutura aditiva interpretável
 \end{itemize}
 
+Resultados mostram desempenho comparável ao GRU,
+com maior controle estrutural.
+
 \end{frame}
+
 
 \end{document}

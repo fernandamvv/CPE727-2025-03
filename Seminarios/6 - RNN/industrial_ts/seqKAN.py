@@ -68,7 +68,6 @@ class SeqKANSeq(nn.Module):
         output_size,
         kan_params=None,
         device=None,
-        output_size_rebuild=None,
         concat_mask: bool = False,
     ):
         super().__init__()
@@ -78,7 +77,6 @@ class SeqKANSeq(nn.Module):
         self.input_size = int(input_size)
         self.hidden_size = int(hidden_size)
         self.output_size = int(output_size)
-        self.output_size_rebuild = int(output_size_rebuild) if output_size_rebuild is not None else None
         self.device = torch.device("cpu") if device is None else torch.device(device)
         self.concat_mask = bool(concat_mask)
 
@@ -100,19 +98,6 @@ class SeqKANSeq(nn.Module):
                 for _ in range(self.output_size)
             ]
         )
-        if self.output_size_rebuild is not None:
-            self.kan_out_rebuild = nn.ModuleList(
-                [
-                    _build_kan(
-                        width=[self.hidden_size, 1],
-                        params=out_params,
-                        device=self.device,
-                    )
-                    for _ in range(self.output_size_rebuild)
-                ]
-            )
-        else:
-            self.kan_out_rebuild = None
 
         topk_cfg = kan_params.get("topk", {}) if isinstance(kan_params, dict) else {}
         self.topk_enabled = bool(topk_cfg.get("enabled", False))
@@ -125,6 +110,8 @@ class SeqKANSeq(nn.Module):
         self.topk_kh = topk_cfg.get("k_h", None)
         self.topk_kout = topk_cfg.get("k_out", None)
         self.topk_kcell = topk_cfg.get("k_cell", None)
+        self.topk_km = topk_cfg.get("k_m", None)
+        self.topk_mask_size = topk_cfg.get("mask_size", None)
         self.last_topk_ratio = {}
         self.current_epoch = None
         self._last_structural_epoch = None
@@ -170,16 +157,49 @@ class SeqKANSeq(nn.Module):
                 new_mask = torch.zeros_like(scores)
                 kkx = min(int(self.topk_kx), x_rows)
                 kkh = min(int(self.topk_kh), h_rows)
-                for j in range(out_dim):
-                    col = scores[:, j]
-                    x_col = col[:x_rows]
-                    h_col = col[x_rows:]
-                    if kkx > 0:
-                        _, idx_x = torch.topk(x_col, k=kkx, dim=0)
-                        new_mask[idx_x, j] = 1.0
-                    if kkh > 0:
-                        _, idx_h = torch.topk(h_col, k=kkh, dim=0)
-                        new_mask[x_rows + idx_h, j] = 1.0
+                if self.topk_km is not None:
+                    if self.topk_kx is None:
+                        raise ValueError("SeqKANSeq: k_m requires k_x to be set.")
+                    if self.topk_mask_size is not None:
+                        m_rows = int(self.topk_mask_size)
+                    else:
+                        if x_rows % 2 != 0:
+                            raise ValueError(
+                                "SeqKANSeq: cannot infer mask_size (input_size not even). "
+                                "Set topk.mask_size explicitly."
+                            )
+                        m_rows = x_rows // 2
+                    if m_rows <= 0 or m_rows >= x_rows:
+                        raise ValueError(
+                            f"SeqKANSeq: invalid mask_size={m_rows} for input_size={x_rows}"
+                        )
+                    x_feat_rows = x_rows - m_rows
+                    kkm = min(int(self.topk_km), m_rows)
+                    for j in range(out_dim):
+                        col = scores[:, j]
+                        x_col = col[:x_feat_rows]
+                        m_col = col[x_feat_rows:x_rows]
+                        h_col = col[x_rows:]
+                        if kkx > 0:
+                            _, idx_x = torch.topk(x_col, k=min(kkx, x_feat_rows), dim=0)
+                            new_mask[idx_x, j] = 1.0
+                        if kkm > 0:
+                            _, idx_m = torch.topk(m_col, k=kkm, dim=0)
+                            new_mask[x_feat_rows + idx_m, j] = 1.0
+                        if kkh > 0:
+                            _, idx_h = torch.topk(h_col, k=kkh, dim=0)
+                            new_mask[x_rows + idx_h, j] = 1.0
+                else:
+                    for j in range(out_dim):
+                        col = scores[:, j]
+                        x_col = col[:x_rows]
+                        h_col = col[x_rows:]
+                        if kkx > 0:
+                            _, idx_x = torch.topk(x_col, k=kkx, dim=0)
+                            new_mask[idx_x, j] = 1.0
+                        if kkh > 0:
+                            _, idx_h = torch.topk(h_col, k=kkh, dim=0)
+                            new_mask[x_rows + idx_h, j] = 1.0
             elif self.topk_structural_mode == "global":
                 total = scores.numel()
                 kk = min(k, total)
@@ -217,9 +237,6 @@ class SeqKANSeq(nn.Module):
             if self.kan_out is not None:
                 for i, head in enumerate(self.kan_out):
                     self._apply_structural_topk(head, self.topk_kout, f"out{i}")
-            if self.kan_out_rebuild is not None:
-                for i, head in enumerate(self.kan_out_rebuild):
-                    self._apply_structural_topk(head, self.topk_kout, f"rebuild_out{i}")
         self._last_structural_epoch = self.current_epoch
 
     def forward(self, x, mask=None, return_last=False):
@@ -231,7 +248,6 @@ class SeqKANSeq(nn.Module):
             raise ValueError("SeqKANSeq: input_size mismatch")
         h = torch.zeros(B, self.hidden_size, device=x.device, dtype=x.dtype)
         outputs = []
-        outputs_rebuild = [] if self.kan_out_rebuild is not None else None
         for t in range(T):
             x_t = x[:, t, :]
             if self.concat_mask:
@@ -252,21 +268,10 @@ class SeqKANSeq(nn.Module):
                 y_list.append(head(h))
             y_t = torch.cat(y_list, dim=-1)
             outputs.append(y_t)
-            if self.kan_out_rebuild is not None:
-                y_list_r = []
-                for i, head in enumerate(self.kan_out_rebuild):
-                    y_list_r.append(head(h))
-                y_t_r = torch.cat(y_list_r, dim=-1)
-                outputs_rebuild.append(y_t_r)
         outputs = torch.stack(outputs, dim=1)
-        last = outputs[:, -1, :]
-        if self.kan_out_rebuild is None:
-            return (outputs, last) if return_last else outputs
-        outputs_rebuild = torch.stack(outputs_rebuild, dim=1)
-        last_rebuild = outputs_rebuild[:, -1, :]
         if return_last:
-            return (outputs, outputs_rebuild), (last, last_rebuild)
-        return outputs, outputs_rebuild
+            return outputs, h
+        return outputs
 
 
 class SeqKANCore(nn.Module):
@@ -353,7 +358,7 @@ class TSDF_seqKANSeq(TSDiffusion):
     def __init__(
         self,
         in_channels: int,
-        hidden_dim: int = 256,
+        hidden_dim: int = 24,
         static_dim: int = 0,
         status_dim: int = 0,
         lam: list[float, float, float, float, float, float] = [0.9, 0.0, 0.0, 0.1, 0.0, 0.0],
@@ -371,9 +376,22 @@ class TSDF_seqKANSeq(TSDiffusion):
         x_min: float | None = None,
         x_max: float | None = None,
         clamp_in_forward: bool = True,
+        noise_on_mask: bool = False,
     ):
         if bi_gru:
             raise ValueError("seqKAN core does not support bi_gru.")
+        if not direct_x:
+            raise ValueError("TSDF_seqKANSeq: direct_x=False not supported in KAN-only mode.")
+        if static_dim > 0:
+            raise ValueError("TSDF_seqKANSeq: static_dim>0 not supported in KAN-only mode.")
+        if status_dim > 0:
+            raise ValueError("TSDF_seqKANSeq: status_dim>0 not supported in KAN-only mode.")
+        if lam[3] > 0.0:
+            raise ValueError("TSDF_seqKANSeq: lam[3]>0 (miss head) not supported in KAN-only mode.")
+        if lam[4] > 0.0 or lam[5] > 0.0:
+            raise ValueError("TSDF_seqKANSeq: VAE components not supported in KAN-only mode.")
+        if log_likelihood:
+            raise ValueError("TSDF_seqKANSeq: log_likelihood not supported in KAN-only mode.")
         super().__init__(
             in_channels=in_channels,
             hidden_dim=hidden_dim,
@@ -389,94 +407,20 @@ class TSDF_seqKANSeq(TSDiffusion):
         self.x_min = x_min
         self.x_max = x_max
         self.clamp_in_forward = bool(clamp_in_forward)
+        self.noise_on_mask = bool(noise_on_mask)
         self._warned_mask_none = False
-        if not self.direct_x:
-            self.encoder = nn.Sequential(
-                nn.Linear(in_channels * 2, hidden_dim),
-                nn.ReLU(),
-            )
-            self.state_dim = hidden_dim
-        else:
-            self.encoder = None
-            self.state_dim = in_channels * 2
-
-        self.static_dim = static_dim
-        if static_dim > 0:
-            self.static_proj = nn.Sequential(
-                nn.Linear(static_dim, self.state_dim),
-                nn.ReLU(),
-            )
-
-        if status_dim > 0:
-            self.tmax_head = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, status_dim),
-            )
-            self.encoder_ode_tmax = SeqKANSeq(
-                input_size=self.state_dim,
-                hidden_size=hidden_dim,
-                output_size=self.state_dim,
-                kan_params=kan_params,
-            )
-            if self.log_likelihood:
-                self.lambda_tmax_head = nn.Sequential(
-                    nn.Linear(self.state_dim, hidden_dim // 2),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim // 2, 1),
-                )
-        if self.lam[3] > 0.0:
-            self.miss_head = nn.Linear(self.state_dim, 1)
+        self.encoder = None
+        self.state_dim = in_channels * 2
+        self.static_dim = 0
         if self.lam[0] > 0.0 or self.lam[4] > 0.0:
+            # Reconstrução direta via KAN out (sem kan_out_rebuild e sem MLP decoder)
             self.encoder_ode_x = SeqKANSeq(
                 input_size=self.state_dim,
                 hidden_size=hidden_dim,
-                output_size=self.state_dim,
+                output_size=in_channels,
                 kan_params=kan_params,
             )
-            self.decoder = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim // 2, in_channels),
-            )
-            if log_likelihood:
-                self.lambda_head = nn.Sequential(
-                    nn.Linear(self.state_dim, hidden_dim // 2),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim // 2, 1),
-                )
-        if self.lam[4] > 0:
-            self.vae_latent = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            )
-            self.vae_decoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, in_channels),
-            )
-            self.vae_sigma_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, in_channels),
-            )
-        if self.lam[5] > 0 and status_dim > 0:
-            self.vae_tmax_latent = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            )
-            self.vae_tmax_decoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim // 2, status_dim),
-            )
-            self.vae_tmax_sigma_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim // 2, status_dim),
-            )
+            self.decoder = None
 
     def forward(
         self,
@@ -525,7 +469,15 @@ class TSDF_seqKANSeq(TSDiffusion):
             else:
                 h = self.encoder(torch.cat([x, mask], dim=-1))
             if not test and self.lam[1] > 0:
-                noise = torch.randn_like(h) * mask_ts
+                if self.noise_on_mask:
+                    noise = torch.randn_like(h)
+                else:
+                    noise = torch.zeros_like(h)
+                    # gera ruído só nas features
+                    noise_x = torch.randn_like(h[:, :, :self.in_channels])
+                    if mask is not None:
+                        noise_x = noise_x * mask  # feature-wise
+                    noise[:, :, :self.in_channels] = noise_x
                 ab = self.alpha_bar[t].view(-1, 1, 1)
                 h = torch.sqrt(ab) * h + torch.sqrt(1 - ab) * noise
             else:
@@ -533,43 +485,16 @@ class TSDF_seqKANSeq(TSDiffusion):
                 noise = None
         else:
             h = x
-        if static_feats is not None and self.static_dim > 0:
-            se = self.static_proj(static_feats).unsqueeze(1)
-            h = h + se
         mask_seqkan = None
-        if not self.direct_x:
-            if mask is not None:
-                if mask.shape[-1] == h.shape[-1]:
-                    mask_seqkan = mask
-                elif h.shape[-1] == mask.shape[-1] * 2:
-                    mask_seqkan = torch.cat([mask, mask], dim=-1)
         if self.lam[0] > 0 or self.lam[4] > 0:
-            h = self.encoder_ode_x(h, mask=mask_seqkan)
-        if self.lam[2] > 0 or self.lam[5] > 0:
-            ht = self.encoder_ode_tmax(h, mask=mask_seqkan)
-            tmax_hat = self.tmax_head(ht)
+            outputs, h = self.encoder_ode_x(h, mask=mask_seqkan, return_last=True)
+        ht = None
+        tmax_hat = None
+
+        if return_x_hat and self.lam[0] > 0:
+            x_hat = outputs
         else:
-            ht = None
-            tmax_hat = None
-        if self.lam[4] > 0:
-            mu_logvar = self.vae_latent(h)
-            vae_mu, vae_logvar = torch.chunk(mu_logvar, 2, dim=-1)
-            std = torch.exp(0.5 * vae_logvar)
-            eps = torch.randn_like(std)
-            z_vae = vae_mu + eps * std
-            vae_x = self.vae_decoder(z_vae)
-            vae_logvar_obs = self.vae_sigma_head(z_vae).clamp(min=-5.0, max=5.0)
-
-        if self.lam[5] > 0 and ht is not None:
-            mu_logvar_t = self.vae_tmax_latent(ht)
-            vae_tmax_mu, vae_tmax_logvar = torch.chunk(mu_logvar_t, 2, dim=-1)
-            std_t = torch.exp(0.5 * vae_tmax_logvar)
-            eps_t = torch.randn_like(std_t)
-            z_tmax = vae_tmax_mu + eps_t * std_t
-            vae_tmax = self.vae_tmax_decoder(z_tmax)
-            vae_tmax_logvar_obs = self.vae_tmax_sigma_head(z_tmax).clamp(min=-5.0, max=5.0)
-
-        x_hat = self.decoder(h) if return_x_hat and self.lam[0] > 0 else None
+            x_hat = None
         if x_hat is not None and self.clamp_in_forward:
             if self.x_min is not None:
                 x_hat = x_hat.clamp(min=self.x_min)
