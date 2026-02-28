@@ -88,15 +88,10 @@ class SeqKANSeq(nn.Module):
             params=cell_params,
             device=self.device,
         )
-        self.kan_out = nn.ModuleList(
-            [
-                _build_kan(
-                    width=[self.hidden_size, 1],
-                    params=out_params,
-                    device=self.device,
-                )
-                for _ in range(self.output_size)
-            ]
+        self.kan_out = _build_kan(
+            width=[self.hidden_size, self.output_size],
+            params=out_params,
+            device=self.device,
         )
 
         topk_cfg = kan_params.get("topk", {}) if isinstance(kan_params, dict) else {}
@@ -235,8 +230,7 @@ class SeqKANSeq(nn.Module):
         with torch.no_grad():
             self._apply_structural_topk(self.kan_cell, self.topk_kcell, "cell")
             if self.kan_out is not None:
-                for i, head in enumerate(self.kan_out):
-                    self._apply_structural_topk(head, self.topk_kout, f"out{i}")
+                self._apply_structural_topk(self.kan_out, self.topk_kout, "out")
         self._last_structural_epoch = self.current_epoch
 
     def forward(self, x, mask=None, return_last=False):
@@ -276,10 +270,7 @@ class SeqKANSeq(nn.Module):
             h_prev = h
             h_in = torch.cat([x_in, h_prev], dim=-1)
             h = self.kan_cell(h_in)
-            y_list = []
-            for i, head in enumerate(self.kan_out):
-                y_list.append(head(h))
-            y_t = torch.cat(y_list, dim=-1)
+            y_t = self.kan_out(h)
             outputs.append(y_t)
         outputs = torch.stack(outputs, dim=1)
         if return_last:
