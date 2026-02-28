@@ -258,7 +258,20 @@ class SeqKANSeq(nn.Module):
                 x_in = torch.cat([x_t, m_t], dim=-1)
             else:
                 if mask is not None:
-                    x_t = x_t * mask[:, t, :]
+                    if x_t.shape[-1] == mask.shape[-1]:
+                        x_t = x_t * mask[:, t, :]
+                    else:
+                        m_t = mask[:, t, :]
+                        # assume x_t = [x, mask]; apply mask only on x part
+                        if x_t.shape[-1] == m_t.shape[-1] * 2:
+                            x_feat = x_t[:, : m_t.shape[-1]]
+                            x_mask = x_t[:, m_t.shape[-1] :]
+                            x_feat = x_feat * m_t
+                            x_t = torch.cat([x_feat, x_mask], dim=-1)
+                        else:
+                            raise ValueError(
+                                f"SeqKANSeq: mask shape mismatch. x_t={tuple(x_t.shape)}, mask_t={tuple(m_t.shape)}"
+                            )
                 x_in = x_t
             h_prev = h
             h_in = torch.cat([x_in, h_prev], dim=-1)

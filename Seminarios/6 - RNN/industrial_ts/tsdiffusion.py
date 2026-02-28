@@ -533,19 +533,20 @@ class TSDiffusion(ODEJumpEncoder):
             L2 = torch.tensor(0.0, device=state.device)
             L2_div = torch.tensor(1.0, device=state.device)
             loss = self.lam[0]*L1/L1_div + self.lam[2]*L3/L3_div + self.lam[3]*L4/L4_div + self.lam[4]*L5 + self.lam[5]*L6/L6_div
-    else:
-        # noise_hat may be None for models that do not predict noise
-        if noise_hat is None:
-            L2 = torch.tensor(0.0, device=state.device)
-            L2_div = torch.tensor(1.0, device=state.device)
         else:
-            L2 = F.mse_loss(noise, noise_hat, reduction='sum')
-            L2_div = (torch.ones_like(state) * m_t).sum()
-
-            if L2 / L2_div > 0.1:
-                loss = + self.lam[1] * L2 / L2_div + (self.lam[0]*L1/L1_div + self.lam[2]*L3/L3_div + self.lam[3]*L4/L4_div + self.lam[4]*L5 + self.lam[5]*L6/L6_div) * 1e-3
+            # noise_hat may be None for models that do not predict noise
+            if noise_hat is None:
+                L2 = torch.tensor(0.0, device=state.device)
+                L2_div = torch.tensor(1.0, device=state.device)
+                loss = self.lam[0]*L1/L1_div + self.lam[2]*L3/L3_div + self.lam[3]*L4/L4_div + self.lam[4]*L5 + self.lam[5]*L6/L6_div
             else:
-                loss = self.lam[0]*L1/L1_div + self.lam[1] * L2 / L2_div + self.lam[2]*L3/L3_div + self.lam[3]*L4/L4_div + self.lam[4]*L5 + self.lam[5]*L6/L6_div
+                L2 = F.mse_loss(noise, noise_hat, reduction='sum')
+                L2_div = (torch.ones_like(state) * m_t).sum()
+
+                if L2 / L2_div > 0.1:
+                    loss = + self.lam[1] * L2 / L2_div + (self.lam[0]*L1/L1_div + self.lam[2]*L3/L3_div + self.lam[3]*L4/L4_div + self.lam[4]*L5 + self.lam[5]*L6/L6_div) * 1e-3
+                else:
+                    loss = self.lam[0]*L1/L1_div + self.lam[1] * L2 / L2_div + self.lam[2]*L3/L3_div + self.lam[3]*L4/L4_div + self.lam[4]*L5 + self.lam[5]*L6/L6_div
 
         if lambda1 > 0:
             l1 = sum(

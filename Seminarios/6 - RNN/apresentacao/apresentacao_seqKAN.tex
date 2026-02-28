@@ -40,64 +40,39 @@
 \begin{frame}{Resumo}
 
 \begin{itemize}
-\item Backbone: \textbf{SeqKANSeq} inserido no framework \textbf{TSDiffusion}.
-\item Dinâmica recorrente modelada por KAN com splines univariadas.
-\item Função de perda multi-termo $\mathcal{L} = \sum_i \lambda_i \mathcal{L}_i$.
-\item Nos experimentos: termo de reconstrução (MSE) ativo.
-\item Métrica reportada: MSE (média $\pm$ erro padrão).
+\item Modelo: \textbf{TSDF\_seqKANSeq} em modo \textbf{KAN-only} (sem MLP decoder, sem VAE, sem miss-head, sem status/static).
+\item Entrada do backbone: $u_t = [x_t, m_t] \in \mathbb{R}^{2C}$ (concatenação de dados e máscara).
+\item Backbone: \textbf{SeqKANSeq} com recorrência via splines univariadas e \textbf{top-k estrutural} opcional.
+\item Treino: reconstrução supervisionada (MSE). 
+\item Métrica reportada: Teste MSE (média $\pm$ erro padrão).
 \end{itemize}
 
 \end{frame}
 
 \section{Metodologia}
-\begin{frame}{1. Estrutura Geral da Célula}
+\begin{frame}{1. Estrutura Geral (no TSDF\_seqKANSeq)}
 
-A célula implementa, no caso padrão (\texttt{concat\_mask=False}):
-
+No modo \textbf{KAN-only}, a entrada do backbone é:
 
 \[
-h_t = \mathrm{KAN}_{cell}\big([x_t, h_{t-1}]\big),
-\quad
-x_t \in \mathbb{R}^{C}, \; h_{t-1} \in \mathbb{R}^{H}
+u_t = [x_t, m_t] \in \mathbb{R}^{2C}
 \]
+
+onde $m_t$ é a máscara feature-wise (1=observado, 0=ausente).
 
 \medskip
-\textbf{Tratamento de máscara no código:}
 
-\begin{itemize}
-\item Se \texttt{mask} é fornecida e \texttt{concat\_mask=False}, o código faz \textbf{gating multiplicativo} na entrada:
-\[
-x_t \leftarrow x_t \odot m_t
-\]
-onde \(m_t\) é a máscara no tempo \(t\).
+O backbone SeqKANSeq implementa a recorrência:
 
-\item Se \texttt{concat\_mask=True}, a máscara entra como \textbf{feature extra}:
 \[
-x^{in}_t = [x_t, m_t] \in \mathbb{R}^{2C}
-\]
-
-e a recorrência passa a ser:
-\[
-h_t = \mathrm{KAN}_{cell}\big([x_t, m_t, h_{t-1}]\big)
-= \mathrm{KAN}_{cell}\big([x^{in}_t, h_{t-1}]\big)
-\]
-\end{itemize}
-
-\medskip
-Entrada concatenada geral:
-\[
-z_t = [x^{in}_t, h_{t-1}] \in \mathbb{R}^{C_{in}+H},
+h_t = \mathrm{KAN}_{cell}\big([u_t, h_{t-1}]\big),
 \quad
-C_{in}=
-\begin{cases}
-C, & \text{se } \texttt{concat\_mask=False}\\
-2C, & \text{se } \texttt{concat\_mask=True}
-\end{cases}
+h_t \in \mathbb{R}^{H}
 \]
+
+com $H=\texttt{hidden\_dim}$ e $u_t \in \mathbb{R}^{2C}$.
 
 \end{frame}
-
-% --------------------------------------------------
 % --------------------------------------------------
 \begin{frame}{2. Seleção Estrutural Top-k (Condicional)}
 
@@ -149,14 +124,14 @@ k_x = \texttt{topk.k\_x},
 k_h = \texttt{topk.k\_h}
 \]
 
-a seleção é feita separadamente:
+a seleção é feita separadamente sobre \textbf{entrada} $u_t$ e \textbf{memória} $h_{t-1}$:
 
 \medskip
 
 \[
 h_{t,j}
 =
-\sum_{i \in \mathcal{S}_j^{(x)}} s_{ij}(x_{t,i})
+\sum_{i \in \mathcal{S}_j^{(u)}} s_{ij}(u_{t,i})
 +
 \sum_{l \in \mathcal{S}_j^{(h)}} s_{lj}(h_{t-1,l})
 \]
@@ -164,7 +139,7 @@ h_{t,j}
 com:
 
 \[
-|\mathcal{S}_j^{(x)}| \le k_x,
+|\mathcal{S}_j^{(u)}| \le k_x,
 \qquad
 |\mathcal{S}_j^{(h)}| \le k_h
 \]
@@ -174,13 +149,12 @@ com:
 Implementação no código:
 
 \begin{itemize}
-\item Primeiras \texttt{input\_size} linhas $\Rightarrow$ entradas
-\item Próximas \texttt{hidden\_size} linhas $\Rightarrow$ estado
+\item Primeiras \texttt{input\_size} linhas $\Rightarrow$ entrada do backbone ($u_t$)
+\item Próximas \texttt{hidden\_size} linhas $\Rightarrow$ estado anterior ($h_{t-1}$)
 \item Seleção top-$k_x$ e top-$k_h$ feita por coluna (por neurônio oculto)
 \end{itemize}
 
 \medskip
-
 Obs.: O número efetivo pode ser menor caso a máscara base já restrinja conexões.
 
 \end{frame}
@@ -213,9 +187,10 @@ O neurônio completo:
 \[
 h_{t,j}
 =
-\sum_{i \in \mathcal{S}_j}
+\sum_{q \in \mathcal{S}_j}
 \sum_{m=1}^{M}
-\alpha_{ijm} B_m(z_{t,i})
+\alpha_{qjm} B_m(v_{t,q})
+\qquad \text{com } v_t = [u_t, h_{t-1}]
 \]
 
 \end{frame}
@@ -246,40 +221,27 @@ Logo,
 
 
 % --------------------------------------------------
-\begin{frame}{6. Camada de Saída}
+\begin{frame}{6. Saída: Reconstrução Direta $\hat{x}_t$}
 
-Para cada saída $k$, o modelo usa uma head KAN:
-
-\[
-\mathrm{KAN}^{(k)}_{\text{out}} : \mathbb{R}^{H} \rightarrow \mathbb{R}
-\quad (\text{width} = [H,1])
-\]
-
-Logo:
+No TSDF\_seqKANSeq (KAN-only), a reconstrução é produzida diretamente por heads KAN:
 
 \[
-y_{t,k} = \mathrm{KAN}^{(k)}_{\text{out}}(h_t)
+\hat{x}_{t,k} = \mathrm{KAN}^{(k)}_{\text{out}}(h_t),
+\quad
+\mathrm{KAN}^{(k)}_{\text{out}}:\mathbb{R}^{H}\rightarrow\mathbb{R}
 \]
+
+com \texttt{width} $=[H,1]$ e $k=1,\dots,C$.
 
 \medskip
 
-Forma estrutural:
+Com top-k estrutural (\texttt{kind=structural}), cada saída usa no máximo:
 
 \[
-y_{t,k}
-=
-\sum_{j=1}^{H}
-M^{(k)}_{j}\; r^{(k)}_{j}(h_{t,j})
+|\{j: M^{(k)}_j=1\}| \le k_{out}
 \]
 
-\medskip
-
-Se \texttt{topk.kind=structural}, aplica-se seleção
-\[
-| \{ j : M^{(k)}_{j}=1 \} | \le k_{out}
-\]
-
-(após \texttt{warmup}, respeitando a máscara base).
+após \texttt{warmup}, respeitando a máscara base do ArticleKAN.
 
 \end{frame}
 
@@ -290,10 +252,10 @@ Se \texttt{topk.kind=structural}, aplica-se seleção
 A célula define a recorrência:
 
 \[
-h_t = F(x_t, h_{t-1})
+h_t = F(u_t, h_{t-1})
 \]
 
-onde $F : \mathbb{R}^{C_{in}+H} \to \mathbb{R}^H$.
+onde $F : \mathbb{R}^{2C+H} \to \mathbb{R}^{H}$.
 
 Se \(x_t = 0\), obtemos um sistema autônomo:
 
@@ -329,8 +291,8 @@ Representação com máscara dependente da época:
 \[
 h_{t,j}
 =
-\sum_{i=1}^{C_{in}}
-M_{ij}^{(x)} s_{ij}(x_{t,i})
+\sum_{i=1}^{2C}
+M_{ij}^{(u)} s_{ij}(u_{t,i})
 +
 \sum_{l=1}^{H}
 M_{lj}^{(h)} s_{lj}(h_{t-1,l})
@@ -391,12 +353,12 @@ TSDF\_GRU  (hidden 24)
 & 0.255656
 & 0.198943  $\pm$ 0.004269 \\
 
-TSDF\_SeqKANSeq (grid 8/hidden 24/k\_x 6 k\_h 6 k\_out 8)
+TSDF\_SeqKANSeq (grid 8/hidden 24/k\_x 4 k\_m 2  k\_h 6 k\_out 8)
 & 0.257547
-& 0.200799 $\pm$ 0.004295 \\  
+&  0.200799 $\pm$ 0.004295 \\  
 
 
-TSDF\_SeqKANSeq (grid 8/hidden 64/k\_x 6 k\_h 15 k\_out 20)
+TSDF\_SeqKANSeq (grid 8/hidden 64/k\_x 4 k\_m 2  k\_h 15 k\_out 20)
 & 
 &  $\pm$  \\  
 
@@ -443,11 +405,11 @@ TSDF\_GRU  (hidden 24)
 & 0.185448 $\pm$  0.004092
 & 0.321018 $\pm$ 0.021071 \\
 
-TSDF\_SeqKANSeq (grid 8/hidden 24/k\_x 6 k\_h 6 k\_out 8)
-& 0.187149 $\pm$ 0.004091 
-& 0.324272  $\pm$ 0.021596 \\
+TSDF\_SeqKANSeq (grid 8/hidden 24/k\_x 4 k\_m 2  k\_h 6 k\_out 8)
+& 0.187149 $\pm$ 0.004091
+& 0.324272  $\pm$  0.021596 \\
 
-TSDF\_SeqKANSeq (grid 8/hidden 64/k\_x 6 k\_h 15 k\_out 20)
+TSDF\_SeqKANSeq (grid 8/hidden 64/k\_x 4 k\_m 2  k\_h 15 k\_out 20)
 & $\pm$  
 &  $\pm$  \\  
 
@@ -485,7 +447,7 @@ TSDF\_SeqKANSeq
 SeqKANSeq implementa:
 
 \[
-h_t = F(x_t, h_{t-1})
+h_t = F(u_t, h_{t-1})
 \]
 
 com:
