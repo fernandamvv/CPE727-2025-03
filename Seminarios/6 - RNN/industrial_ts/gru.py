@@ -316,15 +316,15 @@ class TSDF_GRU(TSDiffusion):
             cost_columns=cost_columns,
             status_dim=status_dim,
             log_likelihood=log_likelihood,
-            sigma_temp=sigma_temp
+            sigma_temp=sigma_temp,
+            x_max=x_max,
+            x_min=x_min
         )
         self.encoder = nn.Sequential(
             nn.Linear(in_channels*2, hidden_dim),
             nn.ReLU(),
         )
         self.state_dim = hidden_dim if not (bi_gru and bi_method == 'concat') else hidden_dim * 2
-        self.x_min = x_min
-        self.x_max = x_max
         self.clamp_in_forward = bool(clamp_in_forward)
 
         self.static_dim = static_dim
@@ -502,7 +502,6 @@ class TSDF_GRU(TSDiffusion):
                 x_hat = x_hat.clamp(max=self.x_max)
 
         return (
-            x,
             h,
             h,
             ht,

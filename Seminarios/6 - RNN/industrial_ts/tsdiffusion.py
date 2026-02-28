@@ -87,7 +87,9 @@ class TSDiffusion(ODEJumpEncoder):
         n_heads_g: int = 4,
         n_layers_g: int = 4,
         log_likelihood: bool = True,
-        sigma_temp: float = 0.7
+        sigma_temp: float = 0.7,
+        x_min: float = None,
+        x_max: float = None
         ):
         super().__init__(
             in_channels=in_channels,
@@ -98,6 +100,8 @@ class TSDiffusion(ODEJumpEncoder):
             n_layers=n_layers,
             cost_columns=cost_columns
         )
+        self.x_min = x_min
+        self.x_max = x_max
         self.log_likelihood = log_likelihood
         self.hidden_dim = hidden_dim
         self.num_steps = num_steps
@@ -838,12 +842,9 @@ class TSDiffusion(ODEJumpEncoder):
                 if predict_state_cols is not None:
                     p = batch[-1]
                 x, ts_batch, m, cc = x.to(device), ts_batch.to(device), m.to(device), cc.to(device)
-                x_raw = x
-                x_raw = x
-                x_raw = x
-                x_raw = x
-                x_raw = x
                 x_batch = x
+                if self.x_min is not None: x = x.clamp(min=self.x_min)
+                if self.x_max is not None: x = x.clamp(max=self.x_max)
                 if s is not None: s = s.to(device)
                 if p is not None: p = p.to(device)
 
@@ -853,8 +854,8 @@ class TSDiffusion(ODEJumpEncoder):
                     m_train = m.clone()
                     m_train[:,-1,:]=0
                 m_train_ts = m_train.any(dim=2, keepdim=True).float()
-                x_masked = x_batch * m_train
 
+                x_masked = x * m_train
                 optimizer.zero_grad(set_to_none=True)
                 # always use test=False during training to enable diffusion noise
                 out = self.forward(
@@ -862,56 +863,28 @@ class TSDiffusion(ODEJumpEncoder):
                     static_feats=s, return_x_hat=True, mask=m_train, mask_ts=m_train_ts, test=False,
                     only_gru=only_gru
                 )
-                if len(out) == 16:
-                    (
-                        x,
-                        state,
-                        _,
-                        state_tmax,
-                        x_hat,
-                        tmax,
-                        noise,
-                        noise_hat,
-                        vae_x,
-                        vae_mu,
-                        vae_logvar,
-                        vae_tmax,
-                        vae_tmax_mu,
-                        vae_tmax_logvar,
-                        vae_logvar_obs,
-                        vae_tmax_logvar_obs,
-                    ) = out
-                    x_forward = x
-                else:
-                    (
-                        state,
-                        _,
-                        state_tmax,
-                        x_hat,
-                        tmax,
-                        noise,
-                        noise_hat,
-                        vae_x,
-                        vae_mu,
-                        vae_logvar,
-                        vae_tmax,
-                        vae_tmax_mu,
-                        vae_tmax_logvar,
-                        vae_logvar_obs,
-                        vae_tmax_logvar_obs,
-                    ) = out
-                    x = x_batch
-                    x_forward = x_batch
-                x_target = x_raw
-                if getattr(self, "clamp_in_forward", False):
-                    if self.x_min is not None:
-                        x_target = x_target.clamp(min=self.x_min)
-                    if self.x_max is not None:
-                        x_target = x_target.clamp(max=self.x_max)
+                (
+                    state,
+                    _,
+                    state_tmax,
+                    x_hat,
+                    tmax,
+                    noise,
+                    noise_hat,
+                    vae_x,
+                    vae_mu,
+                    vae_logvar,
+                    vae_tmax,
+                    vae_tmax_mu,
+                    vae_tmax_logvar,
+                    vae_logvar_obs,
+                    vae_tmax_logvar_obs,
+                ) = out
+                
 
                 if batch_idx == 0:
                     _print_x_stats(
-                        x_target,
+                        x,
                         feature_cols,
                         raw=x_batch,
                         x_min=self.x_min,
@@ -925,7 +898,7 @@ class TSDiffusion(ODEJumpEncoder):
                 with autocast_ctx:
 
                     loss, L1, L2, L3, L4, L5, L6 = self._compute_loss(
-                        x_target, 
+                        x, 
                         x_hat if x_hat is not None else None,
                         tmax,
                         state,
@@ -1297,6 +1270,8 @@ class TSDiffusion(ODEJumpEncoder):
                     p = batch[-1]
                 x, ts_batch, m, cc = x.to(device), ts_batch.to(device), m.to(device), cc.to(device)
                 x_raw = x
+                if self.x_min is not None: x = x.clamp(min=self.x_min)
+                if self.x_max is not None: x = x.clamp(max=self.x_max)
                 if s is not None: s = s.to(device)
                 if p is not None: 
                     p = p.to(device)
@@ -1318,51 +1293,25 @@ class TSDiffusion(ODEJumpEncoder):
                     x_masked, timestamps=ts_batch, static_feats=s,
                     return_x_hat=True, mask=m_train, mask_ts=mask_ts, test=False, only_gru=only_gru
                 )
-                if len(out) == 16:
-                    (
-                        x,
-                        _state,
-                        _,
-                        _state_tmax,
-                        x_hat,
-                        tmax_hat,
-                        noise,
-                        noise_hat,
-                        vae_x,
-                        vae_mu,
-                        vae_logvar,
-                        vae_tmax,
-                        vae_tmax_mu,
-                        vae_tmax_logvar,
-                        vae_logvar_obs,
-                        vae_tmax_logvar_obs,
-                    ) = out
-                    x_forward = x
-                else:
-                    (
-                        _,
-                        _,
-                        _,
-                        x_hat,
-                        tmax_hat,
-                        noise,
-                        noise_hat,
-                        vae_x,
-                        vae_mu,
-                        vae_logvar,
-                        vae_tmax,
-                        vae_tmax_mu,
-                        vae_tmax_logvar,
-                        vae_logvar_obs,
-                        vae_tmax_logvar_obs,
-                    ) = out
-                    x_forward = x_raw
-                x_target = x_raw
-                if getattr(self, "clamp_in_forward", False):
-                    if self.x_min is not None:
-                        x_target = x_target.clamp(min=self.x_min)
-                    if self.x_max is not None:
-                        x_target = x_target.clamp(max=self.x_max)
+                (
+                    _,
+                    _,
+                    _,
+                    x_hat,
+                    tmax_hat,
+                    noise,
+                    noise_hat,
+                    vae_x,
+                    vae_mu,
+                    vae_logvar,
+                    vae_tmax,
+                    vae_tmax_mu,
+                    vae_tmax_logvar,
+                    vae_logvar_obs,
+                    vae_tmax_logvar_obs,
+                ) = out
+                x_forward = x
+                x_target = x
                 
                 offset_state_pred = (p - ts_batch.unsqueeze(-1)).clamp(min=0,max=status_pred_window) / status_pred_window
                 if tmax_hat is None:

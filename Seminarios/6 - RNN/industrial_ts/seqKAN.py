@@ -415,10 +415,10 @@ class TSDF_seqKANSeq(TSDiffusion):
             status_dim=status_dim,
             log_likelihood=log_likelihood,
             sigma_temp=sigma_temp,
+            x_max=x_max,
+            x_min=x_min
         )
         self.direct_x = bool(direct_x)
-        self.x_min = x_min
-        self.x_max = x_max
         self.clamp_in_forward = bool(clamp_in_forward)
         self.noise_on_mask = bool(noise_on_mask)
         self._warned_mask_none = False
@@ -515,7 +515,6 @@ class TSDF_seqKANSeq(TSDiffusion):
                 x_hat = x_hat.clamp(max=self.x_max)
 
         return (
-            x,
             h,
             h,
             ht,
