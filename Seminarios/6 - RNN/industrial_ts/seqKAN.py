@@ -82,12 +82,19 @@ class SeqKANSeq(nn.Module):
 
         cell_params = kan_params.get("cell", kan_params.get("hidden", {}))
         out_params = kan_params.get("output", {})
+        mask_params = kan_params.get("mask", {})
 
         self.kan_cell = _build_kan(
             width=[self.input_size + self.hidden_size, self.hidden_size],
             params=cell_params,
             device=self.device,
         )
+        self.kan_mask = _build_kan(
+            width=[self.input_size +self.hidden_size, self.input_size],
+            params=mask_params,
+            device=self.device,
+        )
+
         self.kan_out = _build_kan(
             width=[self.hidden_size, self.output_size],
             params=out_params,
@@ -233,7 +240,7 @@ class SeqKANSeq(nn.Module):
                 self._apply_structural_topk(self.kan_out, self.topk_kout, "out")
         self._last_structural_epoch = self.current_epoch
 
-    def forward(self, x, return_last=False):
+    def forward(self, x, mask, return_last=False):
         if next(self.parameters()).device != x.device:
             self.to(x.device)
         self._maybe_apply_structural_topk()
@@ -244,8 +251,11 @@ class SeqKANSeq(nn.Module):
         outputs = []
         for t in range(T):
             x_t = x[:, t, :]
-            h_prev = h
-            h_in = torch.cat([x_t, h_prev], dim=-1)
+            mask_t = mask[:, t, :]
+            h_m = torch.cat([x_t, h], dim=-1)
+            x_m = self.kan_mask(h_m)            
+            x_in = x_t * mask_t + x_m * (1 - mask_t)
+            h_in = torch.cat([x_in, h], dim=-1)
             h = self.kan_cell(h_in)
             y_t = self.kan_out(h)
             outputs.append(y_t)
@@ -445,7 +455,7 @@ class TSDF_seqKANSeq(TSDiffusion):
         if mask_ts is None:
             mask_ts = mask.any(dim=2, keepdim=True).float()
         if not already_latent:
-            h = torch.cat([x, mask], dim=-1)
+            h = x
             if not test and self.lam[1] > 0:
                 if self.noise_on_mask:
                     noise = torch.randn_like(h)
@@ -462,9 +472,9 @@ class TSDF_seqKANSeq(TSDiffusion):
                 t = torch.zeros((x.size(0),), device=x.device, dtype=torch.long)
                 noise = None
         else:
-            h = torch.cat([x, mask], dim=-1)
+            h = x
         if self.lam[0] > 0 or self.lam[4] > 0:
-            outputs, h = self.seqKAN(h, return_last=True)
+            outputs, h = self.seqKAN(h, mask, return_last=True)
         ht = None
         tmax_hat = None
 
