@@ -817,6 +817,7 @@ class TSDiffusion(ODEJumpEncoder):
                 idx_max = int(torch.argmax(feat_max).item())
                 print(f"worst_min_feature: {feat_cols[idx_min]} {feat_min[idx_min].item():.1f}")
                 print(f"worst_max_feature: {feat_cols[idx_max]} {feat_max[idx_max].item():.1f}")
+        print_x_stats = False
 
         for ep in range(1, epochs + 1):
             epoch_start = time.time()
@@ -882,7 +883,7 @@ class TSDiffusion(ODEJumpEncoder):
                 ) = out
                 
 
-                if batch_idx == 0:
+                if print_x_stats and batch_idx == 0:
                     _print_x_stats(
                         x,
                         feature_cols,
