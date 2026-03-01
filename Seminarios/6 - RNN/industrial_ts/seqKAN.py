@@ -91,7 +91,7 @@ class SeqKANSeq(nn.Module):
         )
         self.kan_encoder = _build_kan(
             width=[self.input_size * 2, self.hidden_size],
-            params=mask_params,
+            params=cell_params,
             device=self.device,
         )
 
