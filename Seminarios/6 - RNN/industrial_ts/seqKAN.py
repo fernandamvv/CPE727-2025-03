@@ -213,7 +213,7 @@ class SeqKANSeq(nn.Module):
         for t in range(T):
             x_t = x[:, t, :]
             mask_t = mask[:, t, :]
-            xmask_t = torch.cat([x_t,mask_t], dim=-1)
+            xmask_t = torch.cat([x_t,(1-mask_t)], dim=-1)
             z = self.kan_encoder(xmask_t)       
             if self.topk_kh is not None:
                 z = self._apply_input_topk(z, self.topk_kh)     
