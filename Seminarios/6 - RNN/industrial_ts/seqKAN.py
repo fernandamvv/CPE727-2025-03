@@ -220,7 +220,8 @@ class SeqKANSeq(nn.Module):
             z_t = z[:, t, :]  
             if self.topk_kh is not None:
                 z_t = self._apply_input_topk(z_t, self.topk_kh)     
-            h_in = torch.cat([z_t, h, mask_zt*h], dim=-1)
+            m_t = mask_zt*h
+            h_in = torch.cat([z_t, h, m_t], dim=-1)
             h = self.kan_cell(h_in)
             if self.topk_kh is not None:
                 h = self._apply_input_topk(h, self.topk_kh)
