@@ -58,7 +58,7 @@ def _build_kan(width, params, device):
 class SeqKANSeq(nn.Module):
     """
     Sequential KAN cell: h_t = KAN_cell([x_t, h_{t-1}]), y_hat = KAN_out(h_t).
-    Supports feature-wise top-k on x, h and output heads.
+    Supports top-k filtering on stage inputs (x, kan_mask, kan_cell, kan_out).
     """
 
     def __init__(
@@ -90,7 +90,7 @@ class SeqKANSeq(nn.Module):
             device=self.device,
         )
         self.kan_mask = _build_kan(
-            width=[self.input_size +self.hidden_size, self.input_size],
+            width=[self.input_size * 2 +self.hidden_size, self.input_size],
             params=mask_params,
             device=self.device,
         )
@@ -113,7 +113,6 @@ class SeqKANSeq(nn.Module):
         self.topk_kout = topk_cfg.get("k_out", None)
         self.topk_kcell = topk_cfg.get("k_cell", None)
         self.topk_km = topk_cfg.get("k_m", None)
-        self.topk_mask_size = topk_cfg.get("mask_size", None)
         self.last_topk_ratio = {}
         self.current_epoch = None
         self._last_structural_epoch = None
@@ -149,60 +148,7 @@ class SeqKANSeq(nn.Module):
                     )
             scores = scores * (base_mask > 0).float()
             in_dim, out_dim = scores.shape
-            if name == "cell" and self.topk_kx is not None and self.topk_kh is not None:
-                x_rows = self.input_size
-                h_rows = self.hidden_size
-                if in_dim != x_rows + h_rows:
-                    raise ValueError(
-                        f"SeqKANSeq: expected cell in_dim={x_rows + h_rows}, got {in_dim}"
-                    )
-                new_mask = torch.zeros_like(scores)
-                kkx = min(int(self.topk_kx), x_rows)
-                kkh = min(int(self.topk_kh), h_rows)
-                if self.topk_km is not None:
-                    if self.topk_kx is None:
-                        raise ValueError("SeqKANSeq: k_m requires k_x to be set.")
-                    if self.topk_mask_size is not None:
-                        m_rows = int(self.topk_mask_size)
-                    else:
-                        if x_rows % 2 != 0:
-                            raise ValueError(
-                                "SeqKANSeq: cannot infer mask_size (input_size not even). "
-                                "Set topk.mask_size explicitly."
-                            )
-                        m_rows = x_rows // 2
-                    if m_rows <= 0 or m_rows >= x_rows:
-                        raise ValueError(
-                            f"SeqKANSeq: invalid mask_size={m_rows} for input_size={x_rows}"
-                        )
-                    x_feat_rows = x_rows - m_rows
-                    kkm = min(int(self.topk_km), m_rows)
-                    for j in range(out_dim):
-                        col = scores[:, j]
-                        x_col = col[:x_feat_rows]
-                        m_col = col[x_feat_rows:x_rows]
-                        h_col = col[x_rows:]
-                        if kkx > 0:
-                            _, idx_x = torch.topk(x_col, k=min(kkx, x_feat_rows), dim=0)
-                            new_mask[idx_x, j] = 1.0
-                        if kkm > 0:
-                            _, idx_m = torch.topk(m_col, k=kkm, dim=0)
-                            new_mask[x_feat_rows + idx_m, j] = 1.0
-                        if kkh > 0:
-                            _, idx_h = torch.topk(h_col, k=kkh, dim=0)
-                            new_mask[x_rows + idx_h, j] = 1.0
-                else:
-                    for j in range(out_dim):
-                        col = scores[:, j]
-                        x_col = col[:x_rows]
-                        h_col = col[x_rows:]
-                        if kkx > 0:
-                            _, idx_x = torch.topk(x_col, k=kkx, dim=0)
-                            new_mask[idx_x, j] = 1.0
-                        if kkh > 0:
-                            _, idx_h = torch.topk(h_col, k=kkh, dim=0)
-                            new_mask[x_rows + idx_h, j] = 1.0
-            elif self.topk_structural_mode == "global":
+            if self.topk_structural_mode == "global":
                 total = scores.numel()
                 kk = min(k, total)
                 flat_scores = scores.reshape(-1)
@@ -235,29 +181,60 @@ class SeqKANSeq(nn.Module):
         if self._last_structural_epoch == self.current_epoch:
             return
         with torch.no_grad():
+            # Structural pruning remains optional and explicit via k_cell.
             self._apply_structural_topk(self.kan_cell, self.topk_kcell, "cell")
-            if self.kan_out is not None:
-                self._apply_structural_topk(self.kan_out, self.topk_kout, "out")
         self._last_structural_epoch = self.current_epoch
 
-    def forward(self, x, mask, return_last=False):
+    def _topk_input_active(self):
+        if not self.topk_enabled:
+            return False
+        if self.current_epoch is None:
+            return True
+        return self.current_epoch > self.topk_warmup_epochs
+
+    def _apply_input_topk(self, x, k):
+        if not self._topk_input_active() or k is None:
+            return x
+        k = int(k)
+        if k <= 0:
+            return torch.zeros_like(x)
+        dim = x.shape[-1]
+        if k >= dim:
+            return x
+        with torch.no_grad():
+            idx = torch.topk(x.abs(), k=k, dim=-1).indices
+            m = torch.zeros_like(x)
+            m.scatter_(-1, idx, 1.0)
+        return x * m
+
+    def forward(self, x, mask=None, return_last=False):
         if next(self.parameters()).device != x.device:
             self.to(x.device)
         self._maybe_apply_structural_topk()
         B, T, C = x.shape
         if C != self.input_size:
             raise ValueError("SeqKANSeq: input_size mismatch")
+        if mask is None:
+            mask = torch.ones_like(x)
+        if mask.shape != x.shape:
+            raise ValueError(
+                f"SeqKANSeq: mask shape mismatch. Expected {tuple(x.shape)}, got {tuple(mask.shape)}"
+            )
         h = torch.zeros(B, self.hidden_size, device=x.device, dtype=x.dtype)
         outputs = []
         for t in range(T):
             x_t = x[:, t, :]
             mask_t = mask[:, t, :]
-            h_m = torch.cat([x_t, h], dim=-1)
+            x_t = self._apply_input_topk(x_t, self.topk_kx)
+            h_m = torch.cat([x_t,mask_t, h], dim=-1)
+            h_m = self._apply_input_topk(h_m, self.topk_km)
             x_m = self.kan_mask(h_m)            
             x_in = x_t * mask_t + x_m * (1 - mask_t)
             h_in = torch.cat([x_in, h], dim=-1)
+            h_in = self._apply_input_topk(h_in, self.topk_kh)
             h = self.kan_cell(h_in)
-            y_t = self.kan_out(h)
+            h_out = self._apply_input_topk(h, self.topk_kout)
+            y_t = self.kan_out(h_out)
             outputs.append(y_t)
         outputs = torch.stack(outputs, dim=1)
         if return_last:
@@ -401,7 +378,7 @@ class TSDF_seqKANSeq(TSDiffusion):
         self.noise_on_mask = bool(noise_on_mask)
         self._warned_mask_none = False
         self.encoder = None
-        self.state_dim = in_channels * 2
+        self.state_dim = in_channels
         self.static_dim = 0
         if self.lam[0] > 0.0 or self.lam[4] > 0.0:
             # Reconstrução direta via KAN out (sem kan_out_rebuild e sem MLP decoder)
