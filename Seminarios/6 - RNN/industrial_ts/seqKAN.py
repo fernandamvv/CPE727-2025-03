@@ -58,7 +58,7 @@ def _build_kan(width, params, device):
 class SeqKANSeq(nn.Module):
     """
     Sequential KAN cell: h_t = KAN_cell([x_t, h_{t-1}]), y_hat = KAN_out(h_t).
-    Supports top-k filtering on stage inputs (x, kan_mask, kan_cell, kan_out).
+    Supports top-k filtering only on hidden state via `topk.k_h`.
     """
 
     def __init__(
@@ -109,9 +109,6 @@ class SeqKANSeq(nn.Module):
         self.topk_structural_mode = str(topk_cfg.get("conn_mode", "per_out")).lower()
         self.topk_structural_score = str(topk_cfg.get("score", "coef_l2")).lower()
         self.topk_kh = topk_cfg.get("k_h", None)
-        self.topk_kout = topk_cfg.get("k_out", None)
-        self.topk_kcell = topk_cfg.get("k_cell", None)
-        self.topk_km = topk_cfg.get("k_m", None)
         self.last_topk_ratio = {}
         self.current_epoch = None
         self._last_structural_epoch = None
@@ -173,16 +170,8 @@ class SeqKANSeq(nn.Module):
             self.last_topk_ratio[name] = 0.0
 
     def _maybe_apply_structural_topk(self):
-        if not self.topk_enabled or not self.topk_structural:
-            return
-        if self.current_epoch is None or self.current_epoch <= self.topk_warmup_epochs:
-            return
-        if self._last_structural_epoch == self.current_epoch:
-            return
-        with torch.no_grad():
-            # Structural pruning remains optional and explicit via k_cell.
-            self._apply_structural_topk(self.kan_cell, self.topk_kcell, "cell")
-        self._last_structural_epoch = self.current_epoch
+        # Top-k estrutural desativado: o fluxo atual usa apenas topk no estado oculto (k_h).
+        return
 
     def _topk_input_active(self):
         if not self.topk_enabled:
@@ -225,14 +214,13 @@ class SeqKANSeq(nn.Module):
             x_t = x[:, t, :]
             mask_t = mask[:, t, :]
             h_m = torch.cat([x_t,mask_t, h], dim=-1)
-            h_m = self._apply_input_topk(h_m, self.topk_km)
             x_m = self.kan_mask(h_m)            
             x_in = x_t * mask_t + x_m * (1 - mask_t)
             h_in = torch.cat([x_in, h], dim=-1)
-            h_in = self._apply_input_topk(h_in, self.topk_kh)
             h = self.kan_cell(h_in)
-            h_out = self._apply_input_topk(h, self.topk_kout)
-            y_t = self.kan_out(h_out)
+            if self.topk_kh is not None:
+                h = self._apply_input_topk(h, self.topk_kh)
+            y_t = self.kan_out(h)
             outputs.append(y_t)
         outputs = torch.stack(outputs, dim=1)
         if return_last:
