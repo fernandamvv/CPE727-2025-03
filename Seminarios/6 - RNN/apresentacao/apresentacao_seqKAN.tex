@@ -131,51 +131,57 @@ mas a junção entre intervalos é feita de forma \textbf{suave} (continuidade).
 
 
 % --------------------------------------------------
-\begin{frame}{Splines no KAN: função aprendida por conexão}
+% --------------------------------------------------
+\begin{frame}{Splines no KAN: função aprendida por conexão (k=3)}
 \begin{itemize}
 \item No KAN, cada conexão $i\to j$ aprende uma função univariada
 \[
 f_{ij}:\mathbb{R}\rightarrow\mathbb{R},
 \qquad u \mapsto f_{ij}(u)
 \]
-\item Essa função é parametrizada como uma \textbf{B-spline} (combinação linear de bases):
+\item Em vez de uma ativação fixa (ReLU/tanh), $f_{ij}$ é parametrizada como uma \textbf{B-spline}:
 \[
-f_{ij}(u)=\sum_{m=1}^{M}\alpha_{ijm}\,B_m^{(k)}(u)
+f_{ij}(u)=\sum_{m=1}^{M}\alpha_{ijm}\,B_m^{(3)}(u)
 \]
-onde:
+\item Interpretação dos termos:
 \begin{itemize}
-\item $B_m^{(k)}(u)$ são funções base B-spline de ordem $k$ (grau $k-1$),
-\item $\alpha_{ijm}$ são coeficientes aprendidos,
-\item $M$ depende do número de nós (grid) e da ordem $k$.
+\item $B_m^{(3)}(u)$: bases B-spline de \textbf{ordem 3} (grau 2, quadráticas),
+\item $\alpha_{ijm}$: coeficientes aprendidos por treino,
+\item $M$: número de bases (depende do número de nós no grid).
 \end{itemize}
-\item Intuição: o modelo não escolhe uma ativação fixa; ele aprende a \textbf{curva} $f_{ij}$ em cada aresta.
+\item Intuição: cada aresta aprende uma \textbf{curva suave} $u\mapsto f_{ij}(u)$, inspecionável e controlável.
 \end{itemize}
 \end{frame}
-
 % --------------------------------------------------
-\begin{frame}{Nós, suporte local e suavidade das B-splines}
+% --------------------------------------------------
+\begin{frame}{Nós (grid), suporte local e suavidade (k=3)}
 \begin{itemize}
-\item A spline é definida em relação a uma sequência de nós
+\item A spline é definida a partir de uma sequência de nós (grid)
 \[
-t_0 \le t_1 \le \cdots \le t_{K}
+t_0 \le t_1 \le \cdots \le t_{K},
+\qquad u \in [t_0,t_{K}]
 \]
-(o \textbf{grid} cobre um intervalo de interesse, e.g. $[a,b]$).
-\item Cada base B-spline tem \textbf{suporte local}:
+\item \textbf{Suporte local}: cada base afeta apenas uma região do eixo-$u$:
 \[
-B_m^{(k)}(u)=0 \quad \text{fora de } [t_m,\; t_{m+k}]
+B_m^{(3)}(u)=0 \quad \text{fora de } [t_m,\; t_{m+3}]
 \]
-Logo, ajustar $\alpha_{ijm}$ afeta $f_{ij}$ apenas em uma região do eixo-$u$.
-\item \textbf{Suavidade}: uma B-spline de ordem $k$ (grau $k-1$) é tipicamente
+\item \textbf{Suavidade}: com $k=3$ (grau 2), a função aprendida é tipicamente
 \[
-f_{ij} \in C^{k-2}
+f_{ij} \in C^{1}
 \]
-ou seja, tem continuidade de derivadas até ordem $k-2$ (exceto em casos de nós repetidos).
-\item Trade-off:
+isto é, $f_{ij}$ e sua primeira derivada são contínuas (exceto se houver nós repetidos).
+\item Trade-off do grid:
 \begin{itemize}
-\item mais nós $\Rightarrow$ maior flexibilidade (captura não linearidades finas),
-\item menos nós $\Rightarrow$ função mais simples/regularizada.
+\item mais nós $\Rightarrow$ maior flexibilidade para capturar não linearidades finas;
+\item menos nós $\Rightarrow$ função mais simples e mais estável.
 \end{itemize}
 \end{itemize}
+
+\medskip
+\begin{block}{Conexão com o SeqKANSeq}
+\centering
+Essas splines parametrizam as conexões tanto na \(\mathrm{KAN}_{cell}\) (dinâmica) quanto na \(\mathrm{KAN}_{out}\) (reconstrução).
+\end{block}
 \end{frame}
 
 % --------------------------------------------------
@@ -239,34 +245,11 @@ isso limita quantos estados ocultos influenciam cada feature reconstruída.
 \end{itemize}
 \end{frame}
 % --------------------------------------------------
-\begin{frame}{8. Forma da spline por aresta (KAN do artigo)}
-Cada aresta ativa implementa:
-\[
-s_{ij}(u)=\sum_{m=1}^{M}\alpha_{ijm}\,B_m(u)
-\]
-onde:
-\begin{itemize}
-\item $B_m$: base B-spline (ordem \texttt{k})
-\item $\alpha_{ijm}$: coeficientes aprendidos (armazenados em \texttt{coef})
-\item nós definidos por \texttt{grid}, \texttt{grid\_range} e \texttt{grid\_eps}
-\item a máscara estrutural atua zerando arestas: $s_{ij}(\cdot)=0$ se $M_{ij}=0$
-\end{itemize}
-\end{frame}
-
-% --------------------------------------------------
-\begin{frame}{9. Observação estrutural (interpretação)}
-A estrutura do neurônio é aditiva:
-\[
-h_{t,j}=\sum_{q\in\mathcal{S}_j} s_{qj}(v_{t,q}),
-\quad v_t=[x_t,m_t,h_{t-1}]
-\]
-Logo, não existem termos multiplicativos do tipo $z_i z_r$ dentro da mesma aresta; interações cruzadas só emergem via soma no estado e por camadas subsequentes.
-\end{frame}
 
 \section{Resultados}
 
 % --------------------------------------------------
-\begin{frame}{Comparação Final -- Test Results}
+\begin{frame}{Resultados}
 \centering
 \small
 
