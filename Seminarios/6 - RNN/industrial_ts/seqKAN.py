@@ -108,7 +108,6 @@ class SeqKANSeq(nn.Module):
         self.topk_structural = self.topk_kind in ("structural", "connection", "edge", "edges")
         self.topk_structural_mode = str(topk_cfg.get("conn_mode", "per_out")).lower()
         self.topk_structural_score = str(topk_cfg.get("score", "coef_l2")).lower()
-        self.topk_kx = topk_cfg.get("k_x", None)
         self.topk_kh = topk_cfg.get("k_h", None)
         self.topk_kout = topk_cfg.get("k_out", None)
         self.topk_kcell = topk_cfg.get("k_cell", None)
@@ -225,7 +224,6 @@ class SeqKANSeq(nn.Module):
         for t in range(T):
             x_t = x[:, t, :]
             mask_t = mask[:, t, :]
-            x_t = self._apply_input_topk(x_t, self.topk_kx)
             h_m = torch.cat([x_t,mask_t, h], dim=-1)
             h_m = self._apply_input_topk(h_m, self.topk_km)
             x_m = self.kan_mask(h_m)            
