@@ -85,12 +85,12 @@ class SeqKANSeq(nn.Module):
         mask_params = kan_params.get("mask", {})
 
         self.kan_cell = _build_kan(
-            width=[self.hidden_size * 2, self.hidden_size],
+            width=[self.hidden_size * 3, self.hidden_size],
             params=cell_params,
             device=self.device,
         )
         self.kan_encoder = _build_kan(
-            width=[self.input_size * 2, self.hidden_size],
+            width=[self.input_size, self.hidden_size],
             params=cell_params,
             device=self.device,
         )
@@ -100,7 +100,10 @@ class SeqKANSeq(nn.Module):
             params=out_params,
             device=self.device,
         )
+        self.mask_proj = nn.Linear(self.input_size, self.hidden_size)
 
+        nn.init.normal_(self.mask_proj.weight, mean=0.0, std=1e-3)  # pequeno
+        nn.init.zeros_(self.mask_proj.bias)
         topk_cfg = kan_params.get("topk", {}) if isinstance(kan_params, dict) else {}
         self.topk_enabled = bool(topk_cfg.get("enabled", False))
         self.topk_warmup_epochs = int(topk_cfg.get("warmup_epochs", 0) or 0)
@@ -210,14 +213,14 @@ class SeqKANSeq(nn.Module):
             )
         h = torch.zeros(B, self.hidden_size, device=x.device, dtype=x.dtype)
         outputs = []
+        z = self.kan_encoder(x)
+        mask_z = self.mask_proj((1-mask))  # Avoid zero division
         for t in range(T):
-            x_t = x[:, t, :]
-            mask_t = mask[:, t, :]
-            xmask_t = torch.cat([x_t,(1-mask_t)], dim=-1)
-            z = self.kan_encoder(xmask_t)       
+            mask_zt = mask_z[:, t, :]
+            z_t = z[:, t, :]  
             if self.topk_kh is not None:
-                z = self._apply_input_topk(z, self.topk_kh)     
-            h_in = torch.cat([z, h], dim=-1)
+                z_t = self._apply_input_topk(z_t, self.topk_kh)     
+            h_in = torch.cat([z_t, h, mask_zt*h], dim=-1)
             h = self.kan_cell(h_in)
             if self.topk_kh is not None:
                 h = self._apply_input_topk(h, self.topk_kh)
