@@ -213,14 +213,16 @@ class SeqKANSeq(nn.Module):
             )
         h = torch.zeros(B, self.hidden_size, device=x.device, dtype=x.dtype)
         outputs = []
-        z = self.kan_encoder(x)
         mask_z = self.mask_proj((1-mask))  # Avoid zero division
         for t in range(T):
+            x_t = x[:, t, :]
+            
             mask_zt = mask_z[:, t, :]
-            z_t = z[:, t, :]  
+            z_t = self.kan_encoder(x_t)  
             if self.topk_kh is not None:
                 z_t = self._apply_input_topk(z_t, self.topk_kh)     
-            h_in = torch.cat([z_t, h, mask_zt*h], dim=-1)
+            m_t = mask_zt*h
+            h_in = torch.cat([z_t, h, m_t], dim=-1)
             h = self.kan_cell(h_in)
             if self.topk_kh is not None:
                 h = self._apply_input_topk(h, self.topk_kh)
