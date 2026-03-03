@@ -85,21 +85,22 @@ class SeqKANSeq(nn.Module):
         mask_params = kan_params.get("mask", {})
 
         self.kan_cell = _build_kan(
-            width=[self.hidden_size * 3, self.hidden_size],
+            width=[self.input_size + self.hidden_size * 2, self.hidden_size],
             params=cell_params,
             device=self.device,
         )
-        self.kan_encoder = _build_kan(
+        '''self.kan_encoder = _build_kan(
             width=[self.input_size, self.hidden_size],
             params=cell_params,
             device=self.device,
-        )
+        )'''
 
-        self.kan_out = _build_kan(
+        '''self.kan_out = _build_kan(
             width=[self.hidden_size, self.output_size],
             params=out_params,
             device=self.device,
-        )
+        )'''
+        self.kan_out = nn.Linear(self.hidden_size, self.output_size)
         self.mask_proj = nn.Linear(self.input_size, self.hidden_size)
 
         nn.init.normal_(self.mask_proj.weight, mean=0.0, std=1e-3)  # pequeno
@@ -218,11 +219,11 @@ class SeqKANSeq(nn.Module):
             x_t = x[:, t, :]
             
             mask_zt = mask_z[:, t, :]
-            z_t = self.kan_encoder(x_t)  
+            '''z_t = self.kan_encoder(x_t)  
             if self.topk_kh is not None:
-                z_t = self._apply_input_topk(z_t, self.topk_kh)     
+                z_t = self._apply_input_topk(z_t, self.topk_kh)'''
             m_t = mask_zt*h
-            h_in = torch.cat([z_t, h, m_t], dim=-1)
+            h_in = torch.cat([x_t, h, m_t], dim=-1)
             h = self.kan_cell(h_in)
             if self.topk_kh is not None:
                 h = self._apply_input_topk(h, self.topk_kh)
