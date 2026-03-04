@@ -229,7 +229,9 @@ Seminarios/6 - RNN/tsdiffusion.pt
 tmp/
 
 data/
-
+Seminarios/6 - RNN/seqKAN_json/
 *.sif
 seqKAN_results/ignore
 results/
+# modelos pesados
+*.pt

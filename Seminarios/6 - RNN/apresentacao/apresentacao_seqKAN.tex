@@ -16,6 +16,11 @@
 \usetikzlibrary{positioning,arrows.meta}
 
 \usetheme{Madrid}
+\newcommand{\safeimg}[2]{%
+\IfFileExists{#1}{\includegraphics[width=\linewidth]{#1}}{%
+\fbox{\parbox[c][0.52\textheight][c]{0.92\linewidth}{\centering\small Figura pendente:\\\texttt{#2}}}%
+}%
+}
 
 % ======================
 % Infos da capa
@@ -37,218 +42,154 @@
 
 \section{Resumo}
 
-\begin{frame}{Resumo (compatível com o código atual)}
+
+\begin{frame}{Resumo}
 \begin{itemize}
-\item Modelo: \textbf{TSDF\_seqKANSeq} em modo \textbf{KAN-only}:
-      sem MLP decoder, sem VAE, sem miss-head, sem status/static.
-\item Entrada efetiva do backbone (por timestep): \textbf{concatenação explícita}
+\item Modelo: \textbf{TSDF\_seqKANSeq} em modo \textbf{KAN-only} com \textbf{rebuild} (reconstru\c{c}\~ao direta).
+\item Entrada observada por tempo:
 \[
-s_t = [x_t, m_t] \in \mathbb{R}^{2C}
+x_t \in \mathbb{R}^{C}, \qquad \text{mask}_t \in \{0,1\}^{C}
 \]
-onde $m_t$ é máscara feature-wise (1=observado, 0=ausente). No código: \texttt{h = cat([x, mask], -1)}.
-\item Célula recorrente: \textbf{SeqKANSeq} computa
+\item A m\'ascara modula a mem\'oria:
 \[
-h_t = \mathrm{KAN}_{cell}\big([s_t, h_{t-1}]\big), \quad
+z_t = \mathrm{KAN}_{enc}(x_t), \qquad \gamma_t = W(1-\text{mask}_t),
+\qquad m_t = \gamma_t \odot h_{t-1}
+\]
+\item Atualiza\c{c}\~ao recorrente:
+\[
+h_t = \mathrm{KAN}_{cell}\big([\,z_t,\; h_{t-1},\; m_t\,]\big)
+\]
+\item A sa\'ida \'e a reconstru\c{c}\~ao do pr\'oprio $x_t$:
+\[
 \hat{x}_t = \mathrm{KAN}_{out}(h_t)
 \]
-\item Treino supervisionado por reconstrução (MSE). O bloco de difusão injeta ruído em \textbf{[x,mask]} (opcionalmente ruído também na máscara).
+\item Treino por reconstru\c{c}\~ao (MSE).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Resumo}
+\begin{itemize}
+\item O modelo combina \textbf{entrada atual} com \textbf{mem\'oria passada} para reconstruir a s\'erie.
+\item A entrada $x_t$ passa por um KAN (\textbf{KAN\_enc}) para gerar um latente $z_t$.
+\item A m\'ascara indica faltantes e \textbf{modula} a mem\'oria:
+$m_t$ refor\c{c}a/atenua partes de $h_{t-1}$.
+\item A c\'elula recorrente \textbf{junta} $z_t$, $h_{t-1}$ e $m_t$ para produzir o novo estado $h_t$.
+\item A sa\'ida $\hat{x}_t$ \'e lida do estado via \textbf{KAN\_out}.
 \end{itemize}
 \end{frame}
 
 \section{Metodologia}
 
-
-
-\begin{frame}{KAN: ideia central}
+\begin{frame}{ArticleKAN: splines por conex\~ao}
+\small
 \begin{itemize}
-\item Em redes usuais (MLP), cada neurônio combina entradas por pesos lineares:
+\item O backbone usa o \textbf{ArticleKAN}: cada aresta $i\!\to\! j$ aprende uma spline univariada.
+\item Forma geral:
 \[
-y_j = \sum_i w_{ij}\, z_i
+y_j = \sum_i f_{ij}(x_i), \qquad f_{ij} \text{ spline 1D}
 \]
-\item No \textbf{KAN}, cada conexão $i\to j$ é uma \textbf{função univariada aprendida}:
-\[
-y_j = \sum_i f_{ij}(z_i)
-\]
-\item Consequências: estrutura \textbf{aditiva}, maior \textbf{interpretabilidade por conexão} e controle direto do grafo.
+\item Cada spline \'{e} definida por:
+\begin{itemize}
+\item \textbf{grid} (n\'os) e ordem $k$
+\item coeficientes das bases B-spline
 \end{itemize}
-
-\medskip
-\begin{block}{Intuição}
-\centering
-\textit{Troca “peso” por “função 1D” em cada aresta.}
-\end{block}
+\item Vantagens:
+\begin{itemize}
+\item interpretabilidade por conex\~ao (curva $f_{ij}$)
+\item controle estrutural da malha de conex\~oes
+\item n\~ao-linearidade local por partes
+\end{itemize}
+\end{itemize}
 \end{frame}
 
-
-
-% --------------------------------------------------
-\begin{frame}{KAN\_cell e KAN\_out: o que são esses dois blocos?}
-\begin{itemize}
-\item O SeqKANSeq é composto por dois módulos KAN com papéis diferentes:
-\begin{itemize}
-\item \textbf{KAN\_cell (transição do estado)}: atualiza a memória do modelo.
-\item \textbf{KAN\_out (leitura/saída)}: transforma a memória em saída/reconstrução.
-\end{itemize}
-
-\item \textbf{KAN\_cell} implementa a dinâmica recorrente:
+\begin{frame}{Vis\~ao geral: SeqKAN recorrente}
+\small
+Arquitetura por passo de tempo $t$ (com $H=\texttt{hidden\_size}$)
 \[
-h_t = \mathrm{KAN}_{cell}\big([s_t,\, h_{t-1}]\big),
-\qquad s_t=[x_t,m_t]
+\boxed{
+\begin{aligned}
+z_t &= \mathrm{KAN}_{enc}(x_t) \in \mathbb{R}^{H} \\
+\gamma_t &= W(1-\mathrm{mask}_t) + b \in \mathbb{R}^{H} \\
+m_t &= \gamma_t \odot h_{t-1} \in \mathbb{R}^{H} \\
+h_t &= \mathrm{KAN}_{cell}\big([z_t,\; h_{t-1},\; m_t]\big) \in \mathbb{R}^{H} \\
+\hat{x}_t &= \mathrm{KAN}_{out}(h_t) \in \mathbb{R}^{C}
+\end{aligned}}
 \]
-Intuição: “como a entrada atual e o estado anterior se combinam para formar o novo estado”.
 
-\item \textbf{KAN\_out} implementa o head de reconstrução:
-\[
-\hat{x}_t = \mathrm{KAN}_{out}(h_t)
-\]
-Intuição: “como ler o estado oculto para reconstruir as features”.
-
-\item Ambos são \textbf{KAN}: em vez de pesos lineares, usam somas de \textbf{funções univariadas por conexão},
-o que facilita controle estrutural (ex.: Top-k) e interpretabilidade.
-\item Diferença para GRU/LSTM: não há gates multiplicativos; a não linearidade está nas \textbf{funções das conexões}.
+\begin{itemize}
+\item \textbf{KAN\_enc}: projeta $x_t$ (dim $C$) para o espa\c{c}o latente $H$ usando splines por conex\~ao.
+\item \textbf{KAN\_cell}: recebe um vetor de dimens\~ao $3H$ e atualiza a mem\'oria recorrente.
+\item \textbf{KAN\_out}: head de reconstru\c{c}\~ao $\hat{x}_t$ a partir do estado.
 \end{itemize}
 \end{frame}
 
 
 
+
 % --------------------------------------------------
-\begin{frame}{O que são as splines no KAN }
-\begin{itemize}
-\item No KAN, cada conexão $i\to j$ aprende uma função univariada $f_{ij}(\cdot)$.
-Em vez de escolher uma ativação fixa (ReLU, tanh), o modelo \textbf{aprende o formato da curva}.
-\item Essa função é parametrizada como uma \textbf{spline}:
-uma curva \textbf{por partes} definida em intervalos do eixo-$x$.
-\item O domínio é dividido em \textbf{nós} (grid). Em cada intervalo entre nós, a spline usa um polinômio simples,
-mas a junção entre intervalos é feita de forma \textbf{suave} (continuidade).
-\item Intuição prática:
-\begin{itemize}
-\item mais nós $\Rightarrow$ mais flexibilidade para capturar não linearidades;
-\item menos nós $\Rightarrow$ função mais simples e mais estável.
-\end{itemize}
-\item Interpretabilidade: ao inspecionar a curva $f_{ij}(u)$, vemos \textbf{como uma entrada específica influencia} o neurônio de saída.
-\end{itemize}
+\begin{frame}{M\'ascara $\rightarrow$ mem\'oria modulada}
+\small
+
+A m\'ascara gera um gate em hidden via proje\c{c}\~ao linear:
+\[
+\gamma_t = W(1-\mathrm{mask}_t) + b
+\]
+e modula o estado anterior:
+\[
+m_t = \gamma_t \odot h_{t-1}.
+\]
+Este termo $m_t$ entra como \textbf{terceiro bloco} da entrada da c\'elula:
+\[
+h_t = \mathrm{KAN}_{cell}([z_t,\; h_{t-1},\; m_t]).
+\]
+
 \end{frame}
 
+% =========================
+% (4) Top-k — corrigido para o que existe (activation top-k)
+% =========================
+\begin{frame}{Top-k: esparsidade por ativa\c{c}\~ao ($k_h$)}
+\small
+\begin{itemize}
+\item Existe top-k \textbf{por ativa\c{c}\~ao} aplicado aos vetores $z_t$ e $h_t$:
+\[
+z_t \leftarrow \mathrm{TopK}(z_t; k_h), \qquad h_t \leftarrow \mathrm{TopK}(h_t; k_h)
+\]
+mantendo apenas as $k_h$ maiores componentes em magnitude ($|\cdot|$) por amostra/tempo.
+\item Warmup:O top-k s\'o entra ap\'os \texttt{warmup\_epochs}.
 
-% --------------------------------------------------
-% --------------------------------------------------
-\begin{frame}{Splines no KAN: função aprendida por conexão (k=3)}
-\begin{itemize}
-\item No KAN, cada conexão $i\to j$ aprende uma função univariada
-\[
-f_{ij}:\mathbb{R}\rightarrow\mathbb{R},
-\qquad u \mapsto f_{ij}(u)
-\]
-\item Em vez de uma ativação fixa (ReLU/tanh), $f_{ij}$ é parametrizada como uma \textbf{B-spline}:
-\[
-f_{ij}(u)=\sum_{m=1}^{M}\alpha_{ijm}\,B_m^{(3)}(u)
-\]
-\item Interpretação dos termos:
-\begin{itemize}
-\item $B_m^{(3)}(u)$: bases B-spline de \textbf{ordem 3} (grau 2, quadráticas),
-\item $\alpha_{ijm}$: coeficientes aprendidos por treino,
-\item $M$: número de bases (depende do número de nós no grid).
-\end{itemize}
-\item Intuição: cada aresta aprende uma \textbf{curva suave} $u\mapsto f_{ij}(u)$, inspecionável e controlável.
-\end{itemize}
-\end{frame}
-% --------------------------------------------------
-% --------------------------------------------------
-\begin{frame}{Nós (grid), suporte local e suavidade (k=3)}
-\begin{itemize}
-\item A spline é definida a partir de uma sequência de nós (grid)
-\[
-t_0 \le t_1 \le \cdots \le t_{K},
-\qquad u \in [t_0,t_{K}]
-\]
-\item \textbf{Suporte local}: cada base afeta apenas uma região do eixo-$u$:
-\[
-B_m^{(3)}(u)=0 \quad \text{fora de } [t_m,\; t_{m+3}]
-\]
-\item \textbf{Suavidade}: com $k=3$ (grau 2), a função aprendida é tipicamente
-\[
-f_{ij} \in C^{1}
-\]
-isto é, $f_{ij}$ e sua primeira derivada são contínuas (exceto se houver nós repetidos).
-\item Trade-off do grid:
-\begin{itemize}
-\item mais nós $\Rightarrow$ maior flexibilidade para capturar não linearidades finas;
-\item menos nós $\Rightarrow$ função mais simples e mais estável.
-\end{itemize}
+\item \textbf{Bottleneck din\^amico} no hidden, reduzindo complexidade e aumentando interpretabilidade por dimens\~ao ativa.
 \end{itemize}
 
-\medskip
-\begin{block}{Conexão com o SeqKANSeq}
-\centering
-Essas splines parametrizam as conexões tanto na \(\mathrm{KAN}_{cell}\) (dinâmica) quanto na \(\mathrm{KAN}_{out}\) (reconstrução).
-\end{block}
+
+
 \end{frame}
 
 % --------------------------------------------------
-\begin{frame}{Esparsidade Estrutural (Top-k) por neurônio}
+\begin{frame}{Interpretabilidade no KAN: leitura por aresta (edge-wise)}
+\small
 \begin{itemize}
-\item Para aumentar \textbf{interpretabilidade} e \textbf{controle estrutural}, aplicamos \textbf{Top-k} nas conexões do KAN.
-\item Como o KAN é aditivo por arestas, cada neurônio $j$ recebe contribuições por conexões $i\to j$:
+\item Em KAN, cada conex\~ao $i\!\to\! j$ \'{e} uma fun\c{c}\~ao univariada aprendida $f_{ij}(\cdot)$ (spline):
 \[
-y_j = \sum_i f_{ij}(z_i)
+y_j = \sum_i f_{ij}(u_i)
 \]
-\item Com Top-k \textbf{por neurônio}, mantemos apenas as $k$ conexões mais relevantes \textbf{para cada neurônio $j$}:
-\[
-y_j = \sum_{i \in \mathcal{S}_j} f_{ij}(z_i),
-\qquad |\mathcal{S}_j| \le k
-\]
-\item Interpretação: cada neurônio passa a depender de um \textbf{conjunto pequeno e estável de entradas},
-o que simplifica a leitura do grafo e reduz conexões fracas/ruidosas.
+\item No modelo atual existem tr\^es conjuntos de fun\c{c}\~oes inspecion\'aveis:
+\begin{itemize}
+\item $\mathrm{KAN}_{enc}$: $f^{enc}_{c\to j}(x_{t,c})$ (feature $\to$ hidden)
+\item $\mathrm{KAN}_{cell}$: $f^{cell}_{j\to r}([z,h,m]_{t,j})$ (din\^amica no hidden)
+\item $\mathrm{KAN}_{out}$: $f^{out}_{j\to c}(h_{t,j})$ (hidden $\to$ feature reconstru\'ida)
 \end{itemize}
-
-\medskip
-\begin{block}{Onde aplicamos}
-\centering
-Na célula recorrente ($[x_t,m_t]$ e $h_{t-1}$) e/ou no head de saída ($h_t \rightarrow \hat{x}_t$).
-\end{block}
+\item Estrat\'egia de explica\c{c}\~ao recomendada: selecionar arestas mais relevantes (por $|\text{coef}|$ ou contribui\c{c}\~ao) e plotar suas splines.
+\end{itemize}
 \end{frame}
 
 
 
 
-
-% --------------------------------------------------
-\begin{frame}{Top-k na célula recorrente (entrada vs memória)}
-\begin{itemize}
-\item Na atualização do estado, o SeqKANSeq combina \textbf{entrada} e \textbf{memória}:
-\[
-h_t = \mathrm{KAN}_{cell}\big([x_t, m_t, h_{t-1}]\big)
-\]
-\item Com \textbf{Top-k por neurônio}, cada neurônio oculto seleciona apenas um número limitado de conexões relevantes.
-\item Essa seleção pode ser feita \textbf{separando as fontes}:
-\begin{itemize}
-\item até $k_x$ conexões vindas da \textbf{entrada} ($[x_t,m_t]$),
-\item até $k_h$ conexões vindas da \textbf{memória} ($h_{t-1}$),
-\item (opcional) tratar a \textbf{máscara} $m_t$ separadamente para não competir com as features de $x_t$.
-\end{itemize}
-\item Intuição: controlar \textbf{quantas variáveis do instante} e \textbf{quanta memória passada} cada neurônio pode usar.
-\end{itemize}
-\end{frame}
-
-% --------------------------------------------------
-% --------------------------------------------------
-\begin{frame}{Top-k no head de saída (reconstrução)}
-\begin{itemize}
-\item A reconstrução é produzida por um head (KAN) que lê o estado:
-\[
-\hat{x}_t = \mathrm{KAN}_{out}(h_t)
-\]
-\item Com \textbf{Top-k por saída}, cada componente $\hat{x}_{t,k}$ depende de apenas algumas dimensões de $h_t$:
-isso limita quantos estados ocultos influenciam cada feature reconstruída.
-\item Em todos os casos, o Top-k atua como \textbf{máscara estrutural}: ele \textbf{remove conexões} sem mudar a forma das funções nas conexões mantidas.
-\item A seleção respeita as conexões permitidas pelo modelo-base (máscara estrutural inicial).
-\end{itemize}
-\end{frame}
 % --------------------------------------------------
 
 \section{Resultados}
 
-% --------------------------------------------------
 \begin{frame}{Resultados}
 \centering
 \small
@@ -260,89 +201,132 @@ Modelo
 & Loss (train)
 & Teste MSE ($\mu \pm \mathrm{SE}$)  \\
 \midrule
+TSDF\_GRU  ($H{=}352$)
+& 0.191
+& 0.146 $\pm$ 0.003 \\
 
-TSDF\_GRU  (hidden 8)
-& 0.189331
-& 0.147292  $\pm$ 0.003195 \\
+TSDF\_SeqKANSeq ($H{=}24$)
+& 0.215
+& 0.159 $\pm$  0.003 \\
 
-TSDF\_GRU  (hidden 24)
-& 0.181741
-& 0.145757 $\pm$ 0.003234 \\
+TSDF\_GRU  ($H{=}24$ )
+& 0.213
+& 0.163 $\pm$ 0.003 \\
 
-TSDF\_GRU  (hidden 11 * 32)
-& 0.184935
-& 0.145667 $\pm$ 0.003229 \\
+TSDF\_SeqKANSeq ($H{=}352$)
+& 0.229
+&  0.169 $\pm$ 0.004 \\
 
-TSDF\_SeqKANSeq (grid 8 / hidden 8 / $k_x{=}4$ $k_m{=}2$ $k_h{=}4$ $k_{out}{=}4$)
-& 0.250516
-& 0.175399 $\pm$ 0.003855 \\
+TSDF\_SeqKANSeq ($H{=}8$)
+& 0.237
+& 0.173  $\pm$ 0.004 \\
 
-TSDF\_SeqKANSeq (grid 8 / hidden 8 / $k_x{=}2$ $k_m{=}3$ $k_h{=}2$ $k_{out}{=}2$)
-TSDF\_SeqKANSeq (grid 8 / hidden 24 / $k_x{=}4$ $k_m{=}2$ $k_h{=}6$ $k_{out}{=}8$)
-& 0.220477
-& 0.163581 $\pm$ 0.003494 \\
+TSDF\_GRU  ($H{=}8$ )
+& 0.245
+& 0.178  $\pm$ 0.004 \\
 
-TSDF\_SeqKANSeq (grid 8 / hidden 11*32 / $k_x{=}4$ $k_m{=}2$ $k_h{=}88$ $k_{out}{=}117$)
-& \textit{(preencher)}
-& \textit{(preencher)} \\
+
+
 
 \bottomrule
 \end{tabular}
-}
-\end{frame}
+}\end{frame}
 
-% --------------------------------------------------
-\begin{frame}{Comparação Final por Grupos -- Test Results}
+\section{Explainabilidade e Evid\^encias}
+
+\begin{frame}{Fig. 1: MSE vs $H$ (8, 24, 352)}
 \centering
-\small
-
-\resizebox{\linewidth}{!}{%
-\begin{tabular}{l c c}
-\toprule
-Modelo
-& MSE Grupo 0 ($\mu \pm \mathrm{SE}$)
-& MSE Grupo 1 ($\mu \pm \mathrm{SE}$) \\
-\midrule
-TSDF\_GRU  (hidden 8)
-& \textit{(preencher)} & \textit{(preencher)} \\
-
-TSDF\_GRU  (hidden 24)
-& \textit{(preencher)} & \textit{(preencher)} \\
-
-TSDF\_GRU  (hidden 11 * 32)
-& \textit{(preencher)} & \textit{(preencher)} \\
-
-TSDF\_SeqKANSeq (grid 8 / hidden 8 / $k_x{=}4$ $k_m{=}2$ $k_h{=}4$ $k_{out}{=}4$)
-& \textit{(preencher)} & \textit{(preencher)} \\
-
-TSDF\_SeqKANSeq (grid 8 / hidden 24 / $k_x{=}4$ $k_m{=}2$ $k_h{=}6$ $k_{out}{=}8$)
-& \textit{(preencher)} & \textit{(preencher)} \\
-
-TSDF\_SeqKANSeq (grid 8 / hidden 11*32 / $k_x{=}4$ $k_m{=}2$ $k_h{=}88$ $k_{out}{=}117$)
-& \textit{(preencher)} & \textit{(preencher)} \\
-
-\bottomrule
-\end{tabular}
-}
+\safeimg{../seqKAN_results/fig1_mse_vs_h.png}{../seqKAN\_results/fig1\_mse\_vs\_h.png}
 \end{frame}
 
-% --------------------------------------------------
-\begin{frame}{Conclusão (alinhada ao código)}
-O TSDF\_seqKANSeq (KAN-only) implementa:
+\begin{frame}{Fig. 2: Fluxo feature $\rightarrow$ spline $\rightarrow$ hidden $\rightarrow$ output}
+\centering
+\safeimg{../seqKAN_results/fig2_feature_spline_hidden_output.png}{../seqKAN\_results/fig2\_feature\_spline\_hidden\_output.png}
+\end{frame}
+
+\begin{frame}{Fig. 3: Top-20 splines na KAN cell}
+\centering
+\safeimg{../seqKAN_results/fig3_top20_splines_cell.png}{../seqKAN\_results/fig3\_top20\_splines\_cell.png}
+\end{frame}
+
+\begin{frame}{Fig. 4: Edge attribution temporal (cell vs out)}
+\centering
+\safeimg{../seqKAN_results/fig4_edge_attribution_time.png}{../seqKAN\_results/fig4\_edge\_attribution\_time.png}
+\end{frame}
+
+\begin{frame}{Fig. 5: Mapa $|W|$ da sa\'ida linear ($m \times j$)}
+\centering
+\safeimg{../seqKAN_results/fig5_absW_heatmap.png}{../seqKAN\_results/fig5\_absW\_heatmap.png}
+\end{frame}
+
+\begin{frame}{Fig. 6: mean/max $|W \cdot h|$ ao longo do tempo}
+\centering
+\safeimg{../seqKAN_results/fig6_mean_max_absWh_time.png}{../seqKAN\_results/fig6\_mean\_max\_absWh\_time.png}
+\end{frame}
+
+\begin{frame}{Tabela 2: Quadro-resumo MSE + EA + SE + AD}
+\centering
+\scriptsize
+\begin{tabular}{l c c c c c}
+\toprule
+Modelo & Teste MSE ($\mu \pm \mathrm{SE}$) & EA ($\rho$) & SE & AD pass rate & AD $n$ \\
+\midrule
+SeqKAN ($H{=}24$) & $0.159 \pm 0.003$ & $0.5007 \pm 0.0006$ & sparsity$_\epsilon=0.2821$ & 0.25 & 4 \\
+GRU ($H{=}352$)   & $0.146 \pm 0.003$ & $0.5007 \pm 0.0006$ & compress$_{q90}=0.9000$   & 0.50 & 4 \\
+\bottomrule
+\end{tabular}
+\vspace{0.4em}
+
+\tiny
+EA/SE/AD extra\'idos de \texttt{explainability\_v2\_main.csv}; MSE da Tabela de Resultados.
+\end{frame}
+
+\begin{frame}{Tabela 3: Top hidden units e top inputs (cell)}
+\centering
+\scriptsize
+\begin{tabular}{c c c c c}
+\toprule
+Hidden $j$ & mean$|W|$ & max$|W|$ & top $i_{in}$ (cell) & score(s) cell \\
+\midrule
+18 & 0.2490 & 0.6579 & 8,4,9 & 0.3467, 0.2936, 0.2869 \\
+2  & 0.2148 & 0.4404 & 4,9   & 0.3365, 0.2966 \\
+14 & 0.2118 & 0.6988 & 8     & 0.3964 \\
+15 & 0.1963 & 0.7006 & 8     & 0.4364 \\
+9  & 0.1948 & 0.4348 & 4,9   & 0.3459, 0.2845 \\
+17 & 0.1684 & 0.4273 & 6,8   & 0.3739, 0.2889 \\
+\bottomrule
+\end{tabular}
+\vspace{0.4em}
+
+\tiny
+Valores de \texttt{explainability\_v2\_hiddenj\_to\_cell\_topin.csv}.
+\end{frame}
+
+
+% =========================
+% (6) Conclusão
+% =========================
+\begin{frame}{Conclus\~ao (alinhada ao c\'odigo atualizado)}
+O TSDF\_seqKANSeq (KAN-only) implementa reconstru\c{c}\~ao recorrente com tr\^es KANs:
 \[
-h_t = F([x_t,m_t], h_{t-1}), \quad \hat{x}_t = G(h_t)
+z_t=\mathrm{KAN}_{enc}(x_t),\quad
+\]
+\[
+m_t=\gamma_t\odot h_{t-1},\quad
+\]
+\[
+h_t=\mathrm{KAN}_{cell}([z_t,h_{t-1},m_t]),\quad
+\]
+\[
+\hat{x}_t=\mathrm{KAN}_{out}(h_t)
 \]
 
-com:
 \begin{itemize}
-\item Não linearidade distribuída nas arestas (B-splines do ArticleKAN)
-\item Recorrência explícita sem gates multiplicativos (estilo GRU/LSTM)
-\item Top-k estrutural opcional aplicado à \textbf{máscara de conexões} após warmup
-\item Separação explícita do top-k na célula: $x$ vs $m$ vs $h_{t-1}$ (quando configurado)
+\item N\~ao-linearidade distribu\'ida nas arestas (B-splines do \texttt{ArticleKAN}) em \textbf{encoder, c\'elula e sa\'ida}.
+\item M\'ascara atua como \textbf{condicionamento} via $m_t$ (mem\'oria modulada).
+\item Esparsidade: \textbf{Top-k por ativa\c{c}\~ao} em $z_t$ e $h_t$ (par\^ametro $k_h$); top-k estrutural est\'a desligado.
+\item Difus\~ao de missingness aplicada.
 \end{itemize}
-
-Resultados mostram gap em relação ao GRU nas configs atuais,
-mas com maior controle estrutural e interpretabilidade por aresta.
 \end{frame}
 
 \end{document}
