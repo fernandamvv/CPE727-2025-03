@@ -25,7 +25,7 @@
 % ======================
 % Infos da capa
 % ======================
-\title[TSDF\_seqKANSeq - Resultados]{TSDF\_seqKANSeq (KAN-only) \\ Resultados e Estrutura do Treino}
+\title[TSDF\_seqKANSeq - Resultados]{TSDF\_seqKANSeq (KAN + sa\'ida linear) \\ Resultados e Estrutura do Treino}
 \author{Fernanda Mickosz Villa Verde}
 \institute{CPE-883 - Aprendizado de Máquina}
 \date{\today}
@@ -43,38 +43,38 @@
 \section{Resumo}
 
 
-\begin{frame}{Resumo}
+\begin{frame}{Resumo executivo}
 \begin{itemize}
-\item Modelo: \textbf{TSDF\_seqKANSeq} em modo \textbf{KAN-only} com \textbf{rebuild} (reconstru\c{c}\~ao direta).
+\item Modelo: \textbf{TSDF\_seqKANSeq} com \textbf{KAN\_cell + head linear} e \textbf{rebuild} (reconstru\c{c}\~ao direta).
 \item Entrada observada por tempo:
 \[
 x_t \in \mathbb{R}^{C}, \qquad \text{mask}_t \in \{0,1\}^{C}
 \]
 \item A m\'ascara modula a mem\'oria:
 \[
-z_t = \mathrm{KAN}_{enc}(x_t), \qquad \gamma_t = W(1-\text{mask}_t),
+\gamma_t = W(1-\text{mask}_t) + b,
 \qquad m_t = \gamma_t \odot h_{t-1}
 \]
 \item Atualiza\c{c}\~ao recorrente:
 \[
-h_t = \mathrm{KAN}_{cell}\big([\,z_t,\; h_{t-1},\; m_t\,]\big)
+h_t = \mathrm{KAN}_{cell}\big([\,x_t,\; h_{t-1},\; m_t\,]\big)
 \]
 \item A sa\'ida \'e a reconstru\c{c}\~ao do pr\'oprio $x_t$:
 \[
-\hat{x}_t = \mathrm{KAN}_{out}(h_t)
+\hat{x}_t = W_{out} h_t + b_{out}
 \]
-\item Treino por reconstru\c{c}\~ao (MSE).
+\item Loss no modo atual: reconstru\c{c}\~ao (MSE) com termo de difus\~ao opcional.
 \end{itemize}
 \end{frame}
 
-\begin{frame}{Resumo}
+\begin{frame}{Resumo t\'ecnico}
 \begin{itemize}
 \item O modelo combina \textbf{entrada atual} com \textbf{mem\'oria passada} para reconstruir a s\'erie.
-\item A entrada $x_t$ passa por um KAN (\textbf{KAN\_enc}) para gerar um latente $z_t$.
 \item A m\'ascara indica faltantes e \textbf{modula} a mem\'oria:
 $m_t$ refor\c{c}a/atenua partes de $h_{t-1}$.
-\item A c\'elula recorrente \textbf{junta} $z_t$, $h_{t-1}$ e $m_t$ para produzir o novo estado $h_t$.
-\item A sa\'ida $\hat{x}_t$ \'e lida do estado via \textbf{KAN\_out}.
+\item A c\'elula recorrente \textbf{junta} $x_t$, $h_{t-1}$ e $m_t$ para produzir o novo estado $h_t$.
+\item A sa\'ida $\hat{x}_t$ \'e lida do estado via \textbf{head linear} ($W_{out}h_t+b_{out}$).
+\item No wrapper \texttt{TSDF\_seqKANSeq}: \texttt{direct\_x=True}, sem \texttt{bi\_gru}, sem cabe\c{c}as de miss/VAE e sem \texttt{log\_likelihood}.
 \end{itemize}
 \end{frame}
 
@@ -108,23 +108,18 @@ Arquitetura por passo de tempo $t$ (com $H=\texttt{hidden\_size}$)
 \[
 \boxed{
 \begin{aligned}
-z_t &= \mathrm{KAN}_{enc}(x_t) \in \mathbb{R}^{H} \\
 \gamma_t &= W(1-\mathrm{mask}_t) + b \in \mathbb{R}^{H} \\
 m_t &= \gamma_t \odot h_{t-1} \in \mathbb{R}^{H} \\
-h_t &= \mathrm{KAN}_{cell}\big([z_t,\; h_{t-1},\; m_t]\big) \in \mathbb{R}^{H} \\
-\hat{x}_t &= \mathrm{KAN}_{out}(h_t) \in \mathbb{R}^{C}
+h_t &= \mathrm{KAN}_{cell}\big([x_t,\; h_{t-1},\; m_t]\big) \in \mathbb{R}^{H} \\
+\hat{x}_t &= W_{out}h_t + b_{out} \in \mathbb{R}^{C}
 \end{aligned}}
 \]
 
 \begin{itemize}
-\item \textbf{KAN\_enc}: projeta $x_t$ (dim $C$) para o espa\c{c}o latente $H$ usando splines por conex\~ao.
-\item \textbf{KAN\_cell}: recebe um vetor de dimens\~ao $3H$ e atualiza a mem\'oria recorrente.
-\item \textbf{KAN\_out}: head de reconstru\c{c}\~ao $\hat{x}_t$ a partir do estado.
+\item \textbf{KAN\_cell}: recebe um vetor de dimens\~ao $C+2H$ ($x_t$, $h_{t-1}$ e $m_t$) e atualiza a mem\'oria recorrente.
+\item \textbf{Head linear}: reconstru\c{c}\~ao $\hat{x}_t$ a partir do estado.
 \end{itemize}
 \end{frame}
-
-
-
 
 % --------------------------------------------------
 \begin{frame}{M\'ascara $\rightarrow$ mem\'oria modulada}
@@ -140,7 +135,7 @@ m_t = \gamma_t \odot h_{t-1}.
 \]
 Este termo $m_t$ entra como \textbf{terceiro bloco} da entrada da c\'elula:
 \[
-h_t = \mathrm{KAN}_{cell}([z_t,\; h_{t-1},\; m_t]).
+h_t = \mathrm{KAN}_{cell}([x_t,\; h_{t-1},\; m_t]).
 \]
 
 \end{frame}
@@ -151,12 +146,12 @@ h_t = \mathrm{KAN}_{cell}([z_t,\; h_{t-1},\; m_t]).
 \begin{frame}{Top-k: esparsidade por ativa\c{c}\~ao ($k_h$)}
 \small
 \begin{itemize}
-\item Existe top-k \textbf{por ativa\c{c}\~ao} aplicado aos vetores $z_t$ e $h_t$:
+\item Existe top-k \textbf{por ativa\c{c}\~ao} aplicado ao vetor $h_t$:
 \[
-z_t \leftarrow \mathrm{TopK}(z_t; k_h), \qquad h_t \leftarrow \mathrm{TopK}(h_t; k_h)
+h_t \leftarrow \mathrm{TopK}(h_t; k_h)
 \]
 mantendo apenas as $k_h$ maiores componentes em magnitude ($|\cdot|$) por amostra/tempo.
-\item Warmup:O top-k s\'o entra ap\'os \texttt{warmup\_epochs}.
+\item Warmup: o top-k s\'o entra quando \texttt{current\_epoch > warmup\_epochs}.
 
 \item \textbf{Bottleneck din\^amico} no hidden, reduzindo complexidade e aumentando interpretabilidade por dimens\~ao ativa.
 \end{itemize}
@@ -165,21 +160,16 @@ mantendo apenas as $k_h$ maiores componentes em magnitude ($|\cdot|$) por amostr
 
 \end{frame}
 
-% --------------------------------------------------
-\begin{frame}{Interpretabilidade no KAN: leitura por aresta (edge-wise)}
+\begin{frame}{Treino no TSDF\_seqKANSeq (c\'odigo atual)}
 \small
 \begin{itemize}
-\item Em KAN, cada conex\~ao $i\!\to\! j$ \'{e} uma fun\c{c}\~ao univariada aprendida $f_{ij}(\cdot)$ (spline):
+\item Perda efetiva no modo KAN-only:
 \[
-y_j = \sum_i f_{ij}(u_i)
+\mathcal{L} \approx \lambda_0\,\mathcal{L}_{recon} + \lambda_1\,\mathcal{L}_{noise}
 \]
-\item No modelo atual existem tr\^es conjuntos de fun\c{c}\~oes inspecion\'aveis:
-\begin{itemize}
-\item $\mathrm{KAN}_{enc}$: $f^{enc}_{c\to j}(x_{t,c})$ (feature $\to$ hidden)
-\item $\mathrm{KAN}_{cell}$: $f^{cell}_{j\to r}([z,h,m]_{t,j})$ (din\^amica no hidden)
-\item $\mathrm{KAN}_{out}$: $f^{out}_{j\to c}(h_{t,j})$ (hidden $\to$ feature reconstru\'ida)
-\end{itemize}
-\item Estrat\'egia de explica\c{c}\~ao recomendada: selecionar arestas mais relevantes (por $|\text{coef}|$ ou contribui\c{c}\~ao) e plotar suas splines.
+\item $\mathcal{L}_{recon}$: erro de reconstru\c{c}\~ao de $\hat{x}$ (MSE mascarado por observa\c{c}\~oes).
+\item $\mathcal{L}_{noise}$: predi\c{c}\~ao de ru\'ido de difus\~ao, usada apenas quando $\lambda_1>0$.
+\item Restri\c{c}\~oes impostas no construtor: \texttt{direct\_x=True}, \texttt{static\_dim=0}, \texttt{status\_dim=0}, \texttt{log\_likelihood=False}, e $\lambda_3=\lambda_4=\lambda_5=0$.
 \end{itemize}
 \end{frame}
 
@@ -232,100 +222,149 @@ TSDF\_GRU  ($H{=}8$ )
 \end{tabular}
 }\end{frame}
 
-\section{Explainabilidade e Evid\^encias}
-
-\begin{frame}{Fig. 1: MSE vs $H$ (8, 24, 352)}
+\begin{frame}{Comparativo MSE por $H$}
 \centering
-\safeimg{../seqKAN_results/fig1_mse_vs_h.png}{../seqKAN\_results/fig1\_mse\_vs\_h.png}
-\end{frame}
-
-\begin{frame}{Fig. 2: Fluxo feature $\rightarrow$ spline $\rightarrow$ hidden $\rightarrow$ output}
-\centering
-\safeimg{../seqKAN_results/fig2_feature_spline_hidden_output.png}{../seqKAN\_results/fig2\_feature\_spline\_hidden\_output.png}
-\end{frame}
-
-\begin{frame}{Fig. 3: Top-20 splines na KAN cell}
-\centering
-\safeimg{../seqKAN_results/fig3_top20_splines_cell.png}{../seqKAN\_results/fig3\_top20\_splines\_cell.png}
-\end{frame}
-
-\begin{frame}{Fig. 4: Edge attribution temporal (cell vs out)}
-\centering
-\safeimg{../seqKAN_results/fig4_edge_attribution_time.png}{../seqKAN\_results/fig4\_edge\_attribution\_time.png}
-\end{frame}
-
-\begin{frame}{Fig. 5: Mapa $|W|$ da sa\'ida linear ($m \times j$)}
-\centering
-\safeimg{../seqKAN_results/fig5_absW_heatmap.png}{../seqKAN\_results/fig5\_absW\_heatmap.png}
-\end{frame}
-
-\begin{frame}{Fig. 6: mean/max $|W \cdot h|$ ao longo do tempo}
-\centering
-\safeimg{../seqKAN_results/fig6_mean_max_absWh_time.png}{../seqKAN\_results/fig6\_mean\_max\_absWh\_time.png}
-\end{frame}
-
-\begin{frame}{Tabela 2: Quadro-resumo MSE + EA + SE + AD}
-\centering
-\scriptsize
-\begin{tabular}{l c c c c c}
+\small
+\begin{tabular}{c c c}
 \toprule
-Modelo & Teste MSE ($\mu \pm \mathrm{SE}$) & EA ($\rho$) & SE & AD pass rate & AD $n$ \\
+$H$ & seqKAN - MSE & GRU - MSE \\
 \midrule
-SeqKAN ($H{=}24$) & $0.159 \pm 0.003$ & $0.5007 \pm 0.0006$ & sparsity$_\epsilon=0.2821$ & 0.25 & 4 \\
-GRU ($H{=}352$)   & $0.146 \pm 0.003$ & $0.5007 \pm 0.0006$ & compress$_{q90}=0.9000$   & 0.50 & 4 \\
+8   & 0.173 $\pm$ 0.004 & 0.178 $\pm$ 0.004 \\
+24  & 0.159 $\pm$ 0.003 & 0.163 $\pm$ 0.003 \\
+352 & 0.169 $\pm$ 0.004 & 0.146 $\pm$ 0.003 \\
 \bottomrule
 \end{tabular}
-\vspace{0.4em}
-
-\tiny
-EA/SE/AD extra\'idos de \texttt{explainability\_v2\_main.csv}; MSE da Tabela de Resultados.
 \end{frame}
 
-\begin{frame}{Tabela 3: Top hidden units e top inputs (cell)}
-\centering
+
+
+\section{Explicabilidade e Evid\^encias}
+
+\begin{frame}{Sparsidade Estrutural (SE) dos resultados mais recentes}
 \scriptsize
-\begin{tabular}{c c c c c}
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l c c c c}
 \toprule
-Hidden $j$ & mean$|W|$ & max$|W|$ & top $i_{in}$ (cell) & score(s) cell \\
+Modelo & SE (arestas ativas $>\epsilon$) & SE (pesos ativos $>\epsilon$) & SE (hiddens ativos $>\epsilon$) & SE (compress $q90$) \\
 \midrule
-18 & 0.2490 & 0.6579 & 8,4,9 & 0.3467, 0.2936, 0.2869 \\
-2  & 0.2148 & 0.4404 & 4,9   & 0.3365, 0.2966 \\
-14 & 0.2118 & 0.6988 & 8     & 0.3964 \\
-15 & 0.1963 & 0.7006 & 8     & 0.4364 \\
-9  & 0.1948 & 0.4348 & 4,9   & 0.3459, 0.2845 \\
-17 & 0.1684 & 0.4273 & 6,8   & 0.3739, 0.2889 \\
+seqKAN & 0.7179 & --- & --- & --- \\
+GRU    & --- & 0.9159 & 1.0000 & 0.9000 \\
 \bottomrule
 \end{tabular}
-\vspace{0.4em}
+}
 
+\vspace{0.5em}
 \tiny
-Valores de \texttt{explainability\_v2\_hiddenj\_to\_cell\_topin.csv}.
+Fonte: \texttt{explainability\_v2\_main.csv} (timestamp mais recente: 2026-03-04 12:23).\\
+Obs.: no seqKAN, 0.7179 = 1 - sparsity$_\epsilon$ (com sparsity$_\epsilon$ = 0.2821).
 \end{frame}
+
+ 
+
+
+\begin{frame}{Estabilidade de Explainability (EA)}
+\scriptsize
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l c c c}
+\toprule
+M\'etodo (EA) & seqKAN $\rho$ (m\'edia $\pm$ sd) & GRU $\rho$ (m\'edia $\pm$ sd) & $\Delta$ (seqKAN$-$GRU) \\
+\midrule
+Permutation Window & 0.9159 $\pm$ 0.1141 & 0.7953 $\pm$ 0.1208 & +0.1206 \\
+Integrated Gradients (IG) & 1.0000 $\pm$ 0.0000 & 0.9994 $\pm$ 0.0023 & +0.0006 \\
+Grad $\times$ Input & 0.5008 $\pm$ 0.0006 & 0.5007 $\pm$ 0.0006 & +0.0000 \\
+\bottomrule
+\end{tabular}
+}
+\end{frame}
+
+
+\begin{frame}{Regras de Dom\'inio (AD)}
+\small
+\centering
+\begin{tabular}{l c c}
+\toprule
+Modelo & AD pass rate & Regras aprovadas \\
+\midrule
+seqKAN & 0.25 & 1/4 \\
+GRU    & 0.50 & 2/4 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.7em}
+\scriptsize
+Nos sanity checks de forma (monotonicidade/satura\c{c}\~ao/consist\^encia de sinal), a GRU apresentou maior taxa de aprova\c{c}\~ao, indicando necessidade de constraints/regulariza\c{c}\~ao de forma para consolidar o seqKAN em requisitos mandat\'orios de engenharia.
+\end{frame}
+
+
+
+\begin{frame}{Interpretabilidade no KAN: leitura por aresta (edge-wise)}
+\small
+\begin{itemize}
+\item Em KAN, cada conex\~ao $i\!\to\! j$ \'{e} uma fun\c{c}\~ao univariada aprendida $f_{ij}(\cdot)$ (spline):
+\[
+y_j = \sum_i f_{ij}(u_i)
+\]
+\item No modelo atual existe um conjunto de fun\c{c}\~oes spline inspecion\'aveis:
+\begin{itemize}
+\item $\mathrm{KAN}_{cell}$: $f^{cell}_{j\to r}([x,h,m]_{t,j})$ (din\^amica no hidden)
+\item Sa\'ida linear: contribui\c{c}\~ao por peso $W_{out}(c,j)\cdot h_{t,j}$ (hidden $\to$ feature reconstru\'ida)
+\end{itemize}
+\item Estrat\'egia de explica\c{c}\~ao recomendada: selecionar arestas mais relevantes (por $|\text{coef}|$ ou contribui\c{c}\~ao) e plotar suas splines.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Evid\^encia visual dos caminhos}
+\centering
+\IfFileExists{../seqKAN_results/outputseqKANpath.png}{%
+\includegraphics[width=\linewidth,height=0.72\textheight,keepaspectratio]{../seqKAN_results/outputseqKANpath.png}%
+}{%
+\fbox{\parbox[c][0.52\textheight][c]{0.92\linewidth}{\centering\small Figura pendente:\\\texttt{../seqKAN\_results/outputseqKANpath.png}}}%
+}
+\end{frame}
+
+\begin{frame}{Tabela 2. Pontos-chave das splines e contribui\c{c}\~ao no output}
+\scriptsize
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l r r r r r r r l}
+\toprule
+Caminho (feature$\to$hidden$\to$output) & $f(-3)$ & $c(-3)$ & $f(\approx 0)$ & $c(\approx 0)$ & $f(3)$ & $c(3)$ & $\Delta c=c(3)-c(-3)$ & Sinal do efeito \\
+\midrule
+$i{=}8 \to j{=}15 \to m{=}2$ & -0.669 & -0.469 & 0.022 & 0.015 & 0.404 & 0.283 & +0.752 & positivo (forte) \\
+$i{=}6 \to j{=}17 \to m{=}2$ & -0.148 & 0.063 & 0.049 & -0.021 & 0.577 & -0.247 & -0.310 & negativo (moderado) \\
+$i{=}4 \to j{=}9 \to m{=}4$  & -0.294 & -0.128 & -0.005 & -0.002 & 0.590 & 0.257 & +0.384 & positivo (moderado) \\
+\bottomrule
+\end{tabular}
+}
+\end{frame}
+
+
+
+
 
 
 % =========================
 % (6) Conclusão
 % =========================
 \begin{frame}{Conclus\~ao (alinhada ao c\'odigo atualizado)}
-O TSDF\_seqKANSeq (KAN-only) implementa reconstru\c{c}\~ao recorrente com tr\^es KANs:
-\[
-z_t=\mathrm{KAN}_{enc}(x_t),\quad
-\]
+O TSDF\_seqKANSeq (KAN + sa\'ida linear) implementa reconstru\c{c}\~ao recorrente com KAN\_cell e head linear:
 \[
 m_t=\gamma_t\odot h_{t-1},\quad
 \]
 \[
-h_t=\mathrm{KAN}_{cell}([z_t,h_{t-1},m_t]),\quad
+h_t=\mathrm{KAN}_{cell}([x_t,h_{t-1},m_t]),\quad
 \]
 \[
-\hat{x}_t=\mathrm{KAN}_{out}(h_t)
+\hat{x}_t=W_{out}h_t+b_{out}
 \]
 
 \begin{itemize}
-\item N\~ao-linearidade distribu\'ida nas arestas (B-splines do \texttt{ArticleKAN}) em \textbf{encoder, c\'elula e sa\'ida}.
+\item N\~ao-linearidade distribu\'ida nas arestas (B-splines do \texttt{ArticleKAN}) na \textbf{c\'elula}; sa\'ida \'{e} \textbf{linear}.
 \item M\'ascara atua como \textbf{condicionamento} via $m_t$ (mem\'oria modulada).
-\item Esparsidade: \textbf{Top-k por ativa\c{c}\~ao} em $z_t$ e $h_t$ (par\^ametro $k_h$); top-k estrutural est\'a desligado.
-\item Difus\~ao de missingness aplicada.
+\item Esparsidade: \textbf{Top-k por ativa\c{c}\~ao} em $h_t$ (par\^ametro $k_h$); top-k estrutural est\'a desligado.
+\item Difus\~ao \'e \textbf{opcional} ($\lambda_1>0$); no modo padr\~ao, a reconstru\c{c}\~ao domina.
 \end{itemize}
 \end{frame}
 
