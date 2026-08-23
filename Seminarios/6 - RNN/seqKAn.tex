@@ -36,14 +36,14 @@
 
 \begin{document}
 
-\title{\vspace*{1cm}Auditable seqKAN Forecasting for Process Safety in Industrial Compressor Digital Twins%
+\title{\vspace*{1cm}Auditable seqKAN Forecasting for Process Safety Decision Support in Industrial Compressor Digital Twins%
 \thanks{This work was supported in part by Coordena\c{c}\~ao de Aperfei\c{c}oamento de Pessoal de N\'ivel Superior (CAPES), Finance Code 001, and by Conselho Nacional de Desenvolvimento Cient\'ifico e Tecnol\'ogico (CNPq) [grant number to confirm].}}
 
 \author{%
-\IEEEauthorblockN{Fernanda M. Villa Verde, Rodrigo Petrus Domingues, Natanael N. Moura Junior, and Jo\~ao Victor F. Pinto}
+\IEEEauthorblockN{Fernanda Mickosz Villa Verde, Rodrigo Petrus Domingues, Natanael N. Moura Junior, and Jo\~ao Victor F. Pinto}
 \IEEEauthorblockA{\textit{Signal Processing Laboratory, COPPE, Federal University of Rio de Janeiro}\\
 Rio de Janeiro, Brazil\\
-Corresponding author: e-mail to be confirmed.}}
+Corresponding author: fernandamvv@lps.ufrj.br}}
 
 \maketitle
 \conf{\textit{Proc. of International Conference on Artificial Intelligence, Computer, Data Sciences and Applications (ACDSA 2027) \\
@@ -70,7 +70,7 @@ This requirement is particularly relevant for explainable artificial intelligenc
 
 KANs replace fixed node activations and scalar edge weights with learnable univariate functions, typically represented by splines \cite{liu2024}. seqKAN extends this principle to sequential data by embedding recurrence directly in a KAN-based state update. Its original evaluation showed strong interpolation and extrapolation on synthetic physics sequences while retaining visual access to learned functions \cite{boura2025}. Whether this advantage transfers to noisy industrial telemetry, and whether the resulting explanations are stable and engineering-consistent, remains an open question.
 
-This paper evaluates seqKAN using public compressor data from Aker BP’s Valhall field, made available through the Cognite Open Industrial Data project, and compares it with a GRU baseline \cite{cho2014}. The contribution is not a claim that seqKAN is universally more accurate. Instead, we frame interpretability as an auditable evidence package comprising: (i) functional transparency, (ii) perturbation stability, (iii) structural activity, and (iv) engineering validity. This framing is consistent with the broader need to evaluate explanation methods rather than relying on visual plausibility alone \cite{adebayo2018}. Figure~\ref{fig:workflow} summarizes the proposed forecasting-and-assurance workflow: telemetry and observation masks feed the recurrent KAN model, while the resulting forecast is accompanied by explanation evidence before it reaches a digital-twin decision-support service.
+This paper evaluates seqKAN using public compressor data from Aker BP's Valhall field, made available through the Cognite Open Industrial Data project \cite{cognite2018}, and compares it with a GRU baseline \cite{cho2014}. The contribution is not a claim that seqKAN is universally more accurate. Instead, we frame interpretability as an auditable evidence package comprising: (i) functional transparency, (ii) perturbation stability, (iii) structural activity, and (iv) engineering validity. This framing is consistent with the broader need to evaluate explanation methods rather than relying on visual plausibility alone \cite{adebayo2018}. Figure~\ref{fig:workflow} summarizes the proposed forecasting-and-assurance workflow: telemetry and observation masks feed the recurrent KAN model, while the resulting forecast is accompanied by explanation evidence before it reaches a digital-twin decision-support service.
 
 \begin{figure*}[t]
 \centering
@@ -109,7 +109,7 @@ which becomes $22d_h^2+144d_h+11$ for $C=11$, $G=8$ and $k=3$. This gives 2,571,
 
 Both architectures were trained with RAdam, learning rate $2\times10^{-4}$, batch size 512 and gradient clipping at 1.0. The objective was masked reconstruction error on the four evaluated channels. The reported predictive values are from single trained runs. The nominal training limit was 500 epochs for $d_h=8$ and 352 and 1,000 epochs for the principal $d_h=24$ seqKAN model. Early stopping used a patience of 20 epochs; the recorded seqKAN runs stopped after 166, 375 and 86 epochs, respectively. The window split and KAN initialization used seed 42, but a global seed was not reset for all PyTorch, NumPy and CUDA operations. Random masking, parameter initialization and weighted sampling were therefore not fully reproducible across hypothetical reruns.
 
-Both architectures were trained with the same reconstruction objective and evaluated under the same data protocol. No explicit regularization term was included in the principal seqKAN objective. The explainability analyses described below were performed after training and were not part of the optimization objective.
+The explainability analyses described below were performed after training and were not part of the optimization objective
 
 \subsection{Explainability as an Assurance Package}
 Four diagnostics were evaluated on the compact $d_h=24$ models. First, \emph{functional transparency} was assessed by ranking feature--hidden--output paths and inspecting the learned spline $\phi_{ij}$ together with its signed readout contribution $w_{mj}\phi_{ij}(x_i)$. This quantity exposes local sign, slope and saturation, but it is not a causal effect because recurrent state and other edges also contribute.
@@ -223,7 +223,9 @@ exploratory diagnostics.
 \caption{Explainability evidence for the $d_h=24$ models.}
 \label{tab:xai}
 \scriptsize
-\begin{tabular}{p{1.8cm}cc}
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}p{2.5cm}cc@{}}
 \toprule
 Criterion & seqKAN & GRU \\
 \midrule
@@ -235,7 +237,7 @@ Engineering checks & 1/4 & 2/4 \\
 \end{tabular}
 \end{table}
 
-The three evidence groups answer different questions. Prediction error asks whether the model reconstructs held-out values under the implemented split. Functional and attribution evidence asks whether the trained mapping can be inspected and whether feature rankings remain stable under a defined perturbation. Engineering checks ask whether selected responses agree with prior expectations. None of these measures subsumes the others. In particular, the best-performing high-capacity GRU is not automatically the most auditable model, while the more inspectable seqKAN is not automatically the most engineering-consistent model.
+The evidence dimensions answer complementary questions. Prediction error assesses reconstruction performance; functional and attribution diagnostics assess inspectability and explanation stability; structural activity characterizes architecture-specific model complexity; and engineering checks assess consistency with prior expectations. None of these measures subsumes the others. In particular, the best-performing high-capacity GRU is not automatically the most auditable model, while the more inspectable seqKAN is not automatically the most engineering-consistent model.
 
 \section{Discussion}
 The results support an accuracy--auditability trade-off. In compact configurations, seqKAN retained competitive MSE while exposing explicit feature-to-state functions and producing more stable permutation-based rankings. At the largest tested capacity, however, the GRU was substantially more accurate. Model choice should therefore depend on the intended assurance case: a compact interpretable model can be attractive when engineering review and traceability are first-order requirements, whereas a higher-capacity recurrent model may be preferable when predictive accuracy dominates and a separate explanation layer is acceptable.
