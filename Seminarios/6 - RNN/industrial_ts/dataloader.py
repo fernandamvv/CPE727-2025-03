@@ -57,11 +57,16 @@ class DataLoader():
             end=end_time, # Período de 3 meses
             granularity=granularity, # 5 minutos entre cada ponto de dados
             aggregates=["average"], # Média para granulidade
-            ignore_unknown_ids=True # Ignora IDs não encontrados
+            ignore_unknown_ids=True, # Ignora IDs não encontrados
+            include_unit=False,
+            include_aggregate_name=False,
         )
 
-        # Renomeia as colunas para remover o sufixo do agregado e usar a descrição
-        df_data.columns = [col.split('|')[0] for col in df_data.columns]
+        # Versões anteriores do SDK podiam incluir o agregado no nome da coluna.
+        df_data.columns = [
+            (col[0] if isinstance(col, tuple) else col).split('|')[0]
+            for col in df_data.columns
+        ]
         df_data_descriptive = df_data.rename(columns=id_to_description)
         self.df = df_data_descriptive.drop(columns=['PH (CBM) 1st Stage Poly Eff Dev']) # Coluna vazia
 
