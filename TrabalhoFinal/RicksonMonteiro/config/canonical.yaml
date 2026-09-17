@@ -1,5 +1,0 @@
-canonical:
-  output_dir: "data/canonical/"
-  file_format: "json"
-  filename: "canonical_dataset.json"
-  registry_dir: "tracking/datasets"
