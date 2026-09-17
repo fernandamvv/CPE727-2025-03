@@ -1,2 +1,0 @@
-"""Denoising experiment module."""
-
